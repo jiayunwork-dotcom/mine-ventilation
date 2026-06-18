@@ -413,3 +413,229 @@ def plot_rule_preview(
     plt.tight_layout()
     return fig
 
+
+def plot_reliability_heatmap(
+    heatmap_data: Dict,
+    figsize: Tuple[int, int] = (14, 8)
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    branch_ids = heatmap_data['branch_ids']
+    failure_probs = heatmap_data['failure_probs']
+    reliability_drops = np.array(heatmap_data['reliability_drops'])
+    base_reliability = heatmap_data['base_reliability']
+
+    max_drop = np.max(reliability_drops)
+
+    im = ax.imshow(
+        reliability_drops,
+        cmap='Reds',
+        aspect='auto',
+        origin='lower',
+        vmin=0,
+        vmax=max_drop if max_drop > 0 else 0.01,
+        extent=[
+            min(failure_probs) - 0.01,
+            max(failure_probs) + 0.01,
+            -0.5,
+            len(branch_ids) - 0.5
+        ]
+    )
+
+    ax.set_yticks(range(len(branch_ids)))
+    ax.set_yticklabels([f'分支 {bid}' for bid in branch_ids])
+
+    xtick_labels = [f'{fp*100:.0f}%' for fp in failure_probs]
+    ax.set_xticks(failure_probs)
+    ax.set_xticklabels(xtick_labels)
+
+    for i in range(len(branch_ids)):
+        for j in range(len(failure_probs)):
+            drop = reliability_drops[i, j]
+            if drop >= max_drop * 0.3:
+                text_color = 'white'
+            else:
+                text_color = 'black'
+            ax.text(
+                failure_probs[j],
+                i,
+                f'{drop*100:.1f}%',
+                ha='center',
+                va='center',
+                color=text_color,
+                fontsize=8
+            )
+
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('可靠度下降幅度', fontsize=12)
+
+    ax.set_xlabel('故障概率', fontsize=12)
+    ax.set_ylabel('分支编号', fontsize=12)
+    ax.set_title(
+        f'可靠度热力图 (基准可靠度: {base_reliability*100:.1f}%)\n'
+        f'各分支单独故障时的系统可靠度下降幅度',
+        fontsize=14,
+        fontweight='bold'
+    )
+
+    plt.tight_layout()
+
+    return fig
+
+
+def plot_airflow_distribution_histogram(
+    failure_min_airflows: List[float],
+    min_airflow_threshold: float = 4.0,
+    figsize: Tuple[int, int] = (12, 6)
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    arr = np.array(failure_min_airflows)
+
+    n, bins, patches = ax.hist(
+        arr,
+        bins=20,
+        edgecolor='black',
+        alpha=0.7,
+        color='skyblue'
+    )
+
+    for i, patch in enumerate(patches):
+        if bins[i] < min_airflow_threshold:
+            patch.set_facecolor('#ff6b6b')
+
+    ax.axvline(
+        x=min_airflow_threshold,
+        color='red',
+        linestyle='--',
+        linewidth=2,
+        label=f'最低通风量阈值 ({min_airflow_threshold} m³/s)'
+    )
+
+    ax.set_xlabel('最小风量 (m³/s)', fontsize=12)
+    ax.set_ylabel('频率', fontsize=12)
+    ax.set_title(
+        '系统失效时工作面最小风量统计分布\n'
+        f'(失效场景数: {len(arr)})',
+        fontsize=14,
+        fontweight='bold'
+    )
+
+    stats_text = (
+        f'均值: {np.mean(arr):.2f} m³/s\n'
+        f'标准差: {np.std(arr):.2f} m³/s\n'
+        f'5%分位数: {np.percentile(arr, 5):.2f} m³/s'
+    )
+    ax.text(
+        0.02, 0.98,
+        stats_text,
+        transform=ax.transAxes,
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+        verticalalignment='top',
+        fontsize=10
+    )
+
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+
+    return fig
+
+
+def plot_weak_branch_distribution(
+    weak_branch_distribution: Dict[int, float],
+    figsize: Tuple[int, int] = (12, 6)
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    branch_ids = sorted(weak_branch_distribution.keys())
+    frequencies = [weak_branch_distribution[bid] for bid in branch_ids]
+
+    colors = plt.cm.viridis(np.linspace(0, 1, len(branch_ids)))
+
+    bars = ax.bar(
+        range(len(branch_ids)),
+        [f * 100 for f in frequencies],
+        color=colors,
+        edgecolor='black',
+        alpha=0.8
+    )
+
+    ax.set_xlabel('分支编号', fontsize=12)
+    ax.set_ylabel('出现频率 (%)', fontsize=12)
+    ax.set_title(
+        '最薄弱分支频率分布',
+        fontsize=14,
+        fontweight='bold'
+    )
+    ax.set_xticks(range(len(branch_ids)))
+    ax.set_xticklabels([f'分支 {bid}' for bid in branch_ids], rotation=45, ha='right')
+
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            height + 0.5,
+            f'{height:.1f}%',
+            ha='center',
+            va='bottom',
+            fontsize=10,
+            fontweight='bold'
+        )
+
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+
+    return fig
+
+
+def plot_critical_branches(
+    critical_branches: List[Dict],
+    figsize: Tuple[int, int] = (10, 6)
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    branch_ids = [cb['branch_id'] for cb in critical_branches]
+    reliability_drops = [cb['reliability_drop'] * 100 for cb in critical_branches]
+
+    colors = ['#ff6b6b', '#ffa500', '#ffd93d'][:len(critical_branches)]
+
+    bars = ax.barh(
+        range(len(branch_ids)),
+        reliability_drops,
+        color=colors,
+        edgecolor='black',
+        alpha=0.8
+    )
+
+    ax.set_xlabel('可靠度下降幅度 (%)', fontsize=12)
+    ax.set_ylabel('关键分支', fontsize=12)
+    ax.set_title(
+        '关键路径识别 - 前3条关键分支',
+        fontsize=14,
+        fontweight='bold'
+    )
+    ax.set_yticks(range(len(branch_ids)))
+    ax.set_yticklabels([f'分支 {bid}' for bid in branch_ids])
+    ax.invert_yaxis()
+
+    for i, bar in enumerate(bars):
+        width = bar.get_width()
+        ax.text(
+            width + 0.5,
+            bar.get_y() + bar.get_height() / 2,
+            f'{width:.1f}%',
+            ha='left',
+            va='center',
+            fontsize=10,
+            fontweight='bold'
+        )
+
+    ax.grid(True, alpha=0.3, axis='x')
+
+    plt.tight_layout()
+
+    return fig
+
