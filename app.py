@@ -111,7 +111,8 @@ def create_network_from_dataframes(nodes_df: pd.DataFrame, branches_df: pd.DataF
             has_fan=str(row.get('has_fan', False)).lower() in ['true', '1', 'yes'],
             fan_params=fan_params,
             has_damper=str(row.get('has_damper', False)).lower() in ['true', '1', 'yes'],
-            damper_resistance=float(row.get('damper_resistance', 0.0))
+            damper_resistance=float(row.get('damper_resistance', 0.0)),
+            is_atmospheric=str(row.get('is_atmospheric', False)).lower() in ['true', '1', 'yes']
         )
         network.add_branch(branch)
 
@@ -182,9 +183,9 @@ def network_definition_tab():
                 with col_b1:
                     b_id = st.number_input(f'分支编号', min_value=1, value=i+1, key=f'b_id_{i}')
                 with col_b2:
-                    from_n = st.number_input(f'起节点', min_value=1, value=1, key=f'from_{i}')
+                    from_n = st.number_input(f'起节点', min_value=1, value=(i % node_count) + 1, key=f'from_{i}')
                 with col_b3:
-                    to_n = st.number_input(f'止节点', min_value=1, value=2, key=f'to_{i}')
+                    to_n = st.number_input(f'止节点', min_value=1, value=((i + 1) % node_count) + 1, key=f'to_{i}')
                 with col_b4:
                     length = st.number_input(f'长度 (m)', value=500.0, key=f'len_{i}')
                 with col_b5:
@@ -192,7 +193,7 @@ def network_definition_tab():
                 with col_b6:
                     perimeter = st.number_input(f'周长 (m)', value=13.0, key=f'peri_{i}')
 
-                col_b7, col_b8, col_b9, col_b10 = st.columns([1, 1, 1, 1])
+                col_b7, col_b8, col_b9, col_b10, col_b11 = st.columns([1, 1, 1, 1, 1])
                 with col_b7:
                     fric = st.number_input(f'摩擦阻力系数', value=0.012, key=f'fric_{i}', format='%.4f')
                 with col_b8:
@@ -201,6 +202,8 @@ def network_definition_tab():
                     has_fan = st.checkbox(f'有扇风机', key=f'fan_{i}')
                 with col_b10:
                     has_damper = st.checkbox(f'有调节风门', key=f'damper_{i}')
+                with col_b11:
+                    is_atm = st.checkbox(f'大气分支', key=f'atm_{i}')
 
                 if has_fan:
                     col_f1, col_f2, col_f3, col_f4 = st.columns([1, 1, 1, 1])
@@ -229,6 +232,7 @@ def network_definition_tab():
                     'has_fan': has_fan,
                     'has_damper': has_damper,
                     'damper_resistance': damper_r,
+                    'is_atmospheric': is_atm,
                     'fan_a': fa if has_fan else 0.0,
                     'fan_b': fb if has_fan else 0.0,
                     'fan_c': fc if has_fan else 0.0,
@@ -298,7 +302,8 @@ def network_definition_tab():
                     '局部阻力系数': f'{branch.local_coeff:.4f}',
                     '综合阻力 (Ns²/m⁸)': f'{r:.6f}',
                     '扇风机': '是' if branch.has_fan else '否',
-                    '调节风门': '是' if branch.has_damper else '否'
+                    '调节风门': '是' if branch.has_damper else '否',
+                    '大气分支': '是' if branch.is_atmospheric else '否'
                 })
             st.dataframe(pd.DataFrame(branch_data), use_container_width=True, hide_index=True)
 

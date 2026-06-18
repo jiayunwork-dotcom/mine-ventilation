@@ -248,78 +248,55 @@ def calculate_node_pressures(
         if reference_node is not None:
             atmospheric_nodes.add(reference_node)
 
-    reference_nodes = sorted(atmospheric_nodes)
+    ref_node = min(atmospheric_nodes) if atmospheric_nodes else reference_node
+    if ref_node is None:
+        node_ids = list(network.nodes.keys())
+        ref_node = node_ids[0] if node_ids else None
+        if ref_node is None:
+            return {}
 
     node_ids = sorted(network.nodes.keys())
-    reference_set = set(reference_nodes)
-    unknown_nodes = [nid for nid in node_ids if nid not in reference_set]
-    
     pressures: Dict[int, float] = {nid: 0.0 for nid in node_ids}
-    for nid in reference_nodes:
-        pressures[nid] = 0.0
+    pressures[ref_node] = 0.0
 
-    if not unknown_nodes:
-        return pressures
+    visited = {ref_node}
+    queue = [ref_node]
 
-    n_unknowns = len(unknown_nodes)
-    node_to_idx = {nid: i for i, nid in enumerate(unknown_nodes)}
+    undirected_adj: Dict[int, List[Tuple[int, int, int]]] = {}
+    for nid in network.nodes:
+        undirected_adj[nid] = []
+    for bid, branch in network.branches.items():
+        undirected_adj[branch.from_node].append((bid, branch.to_node, 1))
+        undirected_adj[branch.to_node].append((bid, branch.from_node, -1))
 
-    active_branches = [(bid, b) for bid, b in network.branches.items() if not b.is_atmospheric]
-    n_equations = len(active_branches)
-    
-    if n_equations == 0 or n_unknowns == 0:
-        return pressures
+    while queue:
+        current = queue.pop(0)
+        for bid, neighbor, direction in undirected_adj[current]:
+            if neighbor in visited:
+                continue
+            branch = network.get_branch(bid)
+            if branch is None:
+                continue
 
-    A = np.zeros((n_equations, n_unknowns))
-    b = np.zeros(n_equations)
+            q = airflows[bid]
+            r = resistances[bid]
+            h_n = natural_pressures.get(bid, 0.0)
+            h_r = calculate_pressure_drop(r, q)
+            h_fan = 0.0
+            if branch.has_fan and branch.fan_params:
+                q_abs = abs(q)
+                h_fan = calculate_fan_pressure(branch.fan_params, q_abs)
+                if q < 0:
+                    h_fan = -h_fan
 
-    for row, (bid, branch) in enumerate(active_branches):
-        u = branch.from_node
-        v = branch.to_node
-        q = airflows[bid]
-        r = resistances[bid]
-        h_n = natural_pressures.get(bid, 0.0)
+            C = h_r - h_fan + h_n
 
-        h_r = calculate_pressure_drop(r, q)
+            if direction > 0:
+                pressures[neighbor] = pressures[current] - C
+            else:
+                pressures[neighbor] = pressures[current] + C
 
-        h_fan = 0.0
-        if branch.has_fan and branch.fan_params:
-            q_abs = abs(q)
-            h_fan = calculate_fan_pressure(branch.fan_params, q_abs)
-            if q < 0:
-                h_fan = -h_fan
-
-        C = h_r - h_fan + h_n
-
-        if u not in reference_set:
-            A[row, node_to_idx[u]] = 1
-        if v not in reference_set:
-            A[row, node_to_idx[v]] = -1
-
-        rhs = C
-        if u in reference_set:
-            rhs -= pressures[u]
-        if v in reference_set:
-            rhs += pressures[v]
-        b[row] = rhs
-
-    try:
-        if n_equations == n_unknowns:
-            x = np.linalg.solve(A, b)
-        else:
-            x, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
-        for i, nid in enumerate(unknown_nodes):
-            if i < len(x):
-                pressures[nid] = float(x[i])
-    except Exception as e:
-        try:
-            x, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
-            for i, nid in enumerate(unknown_nodes):
-                if i < len(x):
-                    pressures[nid] = float(x[i])
-        except Exception as e2:
-            print(f"求解节点压力失败: {e}, {e2}")
-            for i, nid in enumerate(unknown_nodes):
-                pressures[nid] = 0.0
+            visited.add(neighbor)
+            queue.append(neighbor)
 
     return pressures
