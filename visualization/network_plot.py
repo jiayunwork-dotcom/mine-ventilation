@@ -639,3 +639,321 @@ def plot_critical_branches(
 
     return fig
 
+
+def plot_redundancy_greedy_curve(
+    greedy_steps: List[Dict],
+    target_reliability: float,
+    figsize: Tuple[int, int] = (12, 7)
+) -> plt.Figure:
+    fig, ax1 = plt.subplots(figsize=figsize)
+
+    steps = [s['step'] if isinstance(s, dict) else s.step for s in greedy_steps]
+    costs = [s['cumulative_cost'] if isinstance(s, dict) else s.cumulative_cost for s in greedy_steps]
+    reliabilities = [s['cumulative_reliability'] if isinstance(s, dict) else s.cumulative_reliability for s in greedy_steps]
+    increments = [s['reliability_increment'] if isinstance(s, dict) else s.reliability_increment for s in greedy_steps]
+
+    reliabilities_pct = [r * 100 for r in reliabilities]
+    target_pct = target_reliability * 100
+
+    color1 = '#1f77b4'
+    color2 = '#ff7f0e'
+
+    ax1.plot(
+        costs,
+        reliabilities_pct,
+        'o-',
+        color=color1,
+        linewidth=2.5,
+        markersize=10,
+        label='系统可靠度',
+        zorder=5
+    )
+
+    ax1.axhline(
+        y=target_pct,
+        color='#d62728',
+        linestyle='--',
+        linewidth=2,
+        label=f'目标可靠度 ({target_pct:.1f}%)',
+        zorder=3
+    )
+
+    for i in range(len(costs)):
+        ax1.annotate(
+            f'{reliabilities_pct[i]:.1f}%',
+            (costs[i], reliabilities_pct[i]),
+            textcoords="offset points",
+            xytext=(0, 14),
+            ha='center',
+            fontsize=9,
+            fontweight='bold',
+            color=color1
+        )
+        ax1.annotate(
+            f'步骤{steps[i]}',
+            (costs[i], reliabilities_pct[i]),
+            textcoords="offset points",
+            xytext=(0, -22),
+            ha='center',
+            fontsize=8,
+            color='gray'
+        )
+
+    ax1.fill_between(
+        costs,
+        reliabilities_pct,
+        alpha=0.15,
+        color=color1,
+        zorder=2
+    )
+
+    ax1.set_xlabel('累计成本 (长度×断面积)', fontsize=12)
+    ax1.set_ylabel('系统可靠度 (%)', fontsize=12, color=color1)
+    ax1.tick_params(axis='y', labelcolor=color1)
+
+    ax2 = ax1.twinx()
+    bar_width = max(costs) * 0.03 if max(costs) > 0 else 1
+    increments_pct = [inc * 100 for inc in increments]
+
+    non_zero_mask = [i for i, inc in enumerate(increments_pct) if inc > 0]
+    if non_zero_mask:
+        filtered_costs = [costs[i] for i in non_zero_mask]
+        filtered_incs = [increments_pct[i] for i in non_zero_mask]
+        ax2.bar(
+            filtered_costs,
+            filtered_incs,
+            width=bar_width,
+            alpha=0.4,
+            color=color2,
+            label='该步可靠度增量',
+            zorder=1
+        )
+    ax2.set_ylabel('本步可靠度增量 (%)', fontsize=12, color=color2)
+    ax2.tick_params(axis='y', labelcolor=color2)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right', fontsize=10)
+
+    ax1.set_title(
+        '贪心算法冗余路径组合优化 - 成本/可靠度收益曲线',
+        fontsize=14,
+        fontweight='bold',
+        pad=20
+    )
+
+    ax1.grid(True, alpha=0.3, axis='both')
+    ax1.set_xlim(left=min(costs) - max(costs) * 0.05 if max(costs) > 0 else -1)
+
+    plt.tight_layout()
+
+    return fig
+
+
+def plot_network_with_redundancy(
+    network: VentilationNetwork,
+    recommended_branches: List[Dict],
+    bottleneck_branch_ids: Optional[List[int]] = None,
+    show_airflow: bool = True,
+    show_pressure: bool = True,
+    show_fan_icon: bool = True,
+    figsize: Tuple[int, int] = (12, 9),
+    node_size: int = 800,
+    edge_width_range: Tuple[float, float] = (1.0, 6.0),
+    cmap_name: str = 'viridis',
+    seed: Optional[int] = 42
+) -> plt.Figure:
+    if bottleneck_branch_ids is None:
+        bottleneck_branch_ids = []
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    G = nx.DiGraph()
+
+    for node_id, node in network.nodes.items():
+        G.add_node(node_id, elevation=node.elevation, pressure=node.pressure)
+
+    edge_labels = {}
+    edge_colors = []
+    edge_widths = []
+    edge_styles = []
+    fan_edges = []
+    bottleneck_edges = []
+    redundancy_edges = []
+
+    airflows = [abs(b.airflow) for b in network.branches.values()]
+    max_airflow = max(airflows) if airflows else 1.0
+
+    cmap = plt.get_cmap(cmap_name)
+    norm = Normalize(vmin=0, vmax=max_airflow)
+
+    for branch_id, branch in network.branches.items():
+        q = branch.airflow
+        abs_q = abs(q)
+
+        if max_airflow > 0:
+            width = edge_width_range[0] + (edge_width_range[1] - edge_width_range[0]) * (abs_q / max_airflow)
+            color = cmap(norm(abs_q))
+        else:
+            width = edge_width_range[0]
+            color = 'gray'
+
+        if q >= 0:
+            u, v = branch.from_node, branch.to_node
+        else:
+            u, v = branch.to_node, branch.from_node
+
+        G.add_edge(u, v, branch_id=branch_id, airflow=q)
+
+        if branch_id in bottleneck_branch_ids:
+            color = '#e74c3c'
+            bottleneck_edges.append((u, v))
+
+        edge_colors.append(color)
+        edge_widths.append(width)
+        edge_styles.append('solid')
+
+        label_parts = [f'B{branch_id}']
+        if show_airflow:
+            label_parts.append(f'Q={abs_q:.2f}')
+        edge_labels[(u, v)] = '\n'.join(label_parts)
+
+        if branch.has_fan:
+            fan_edges.append((u, v))
+
+    rec_branch_infos = {}
+    for idx, rec_branch in enumerate(recommended_branches, 1):
+        u = rec_branch['from_node']
+        v = rec_branch['to_node']
+        rec_id = rec_branch.get('candidate_id', f'REC_{idx}')
+
+        G.add_edge(u, v, branch_id=f'rec_{idx}', airflow=0, is_redundant=True)
+        edge_colors.append('#2ecc71')
+        edge_widths.append(3.0)
+        edge_styles.append('dashed')
+        redundancy_edges.append((u, v))
+
+        label_parts = [f'冗余{idx}\n({rec_branch["from_node"]}→{rec_branch["to_node"]})']
+        label_parts.append(f'L={rec_branch["length"]:.0f}m')
+        label_parts.append(f'A={rec_branch["area"]:.2f}m²')
+        edge_labels[(u, v)] = '\n'.join(label_parts)
+
+    if seed is not None:
+        pos = nx.spring_layout(G, seed=seed, k=0.5, iterations=50)
+    else:
+        pos = nx.spring_layout(G, k=0.5, iterations=50)
+
+    solid_edges = [(u, v) for (u, v), style in zip(G.edges(), edge_styles) if style == 'solid']
+    solid_colors = [c for c, s in zip(edge_colors, edge_styles) if s == 'solid']
+    solid_widths = [w for w, s in zip(edge_widths, edge_styles) if s == 'solid']
+
+    dashed_edges = [(u, v) for (u, v), style in zip(G.edges(), edge_styles) if style == 'dashed']
+    dashed_colors = [c for c, s in zip(edge_colors, edge_styles) if s == 'dashed']
+    dashed_widths = [w for w, s in zip(edge_widths, edge_styles) if s == 'dashed']
+
+    nx.draw_networkx_edges(
+        G, pos,
+        edgelist=solid_edges,
+        edge_color=solid_colors,
+        width=solid_widths,
+        arrowstyle='->',
+        arrowsize=18,
+        ax=ax,
+        alpha=0.85
+    )
+
+    nx.draw_networkx_edges(
+        G, pos,
+        edgelist=dashed_edges,
+        edge_color=dashed_colors,
+        width=dashed_widths,
+        style='dashed',
+        arrowstyle='->',
+        arrowsize=20,
+        ax=ax,
+        alpha=0.95
+    )
+
+    for u, v in fan_edges:
+        if show_fan_icon and (u, v) in G.edges():
+            edge_mid = ((pos[u][0] + pos[v][0]) / 2, (pos[u][1] + pos[v][1]) / 2)
+            fan_circle = mpatches.Circle(edge_mid, 0.03, facecolor='red', edgecolor='black', linewidth=2, zorder=10)
+            ax.add_patch(fan_circle)
+            ax.text(edge_mid[0], edge_mid[1], 'F', ha='center', va='center',
+                   fontsize=10, fontweight='bold', color='white', zorder=11)
+
+    node_colors = []
+    pressures = [n.pressure for n in network.nodes.values()]
+    if pressures and max(pressures) != min(pressures):
+        p_norm = Normalize(vmin=min(pressures), vmax=max(pressures))
+        p_cmap = LinearSegmentedColormap.from_list('pressure', ['blue', 'white', 'red'])
+        for node_id in G.nodes():
+            node = network.get_node(node_id)
+            if node:
+                node_colors.append(p_cmap(p_norm(node.pressure)))
+            else:
+                node_colors.append('lightblue')
+    else:
+        node_colors = ['lightblue' for _ in G.nodes()]
+
+    nx.draw_networkx_nodes(
+        G, pos,
+        node_size=node_size,
+        node_color=node_colors,
+        edgecolors='black',
+        linewidths=2,
+        ax=ax
+    )
+
+    node_labels = {}
+    for node_id in G.nodes():
+        node = network.get_node(node_id)
+        label = f'N{node_id}\n'
+        if node and show_pressure:
+            label += f'{node.pressure:.1f} Pa'
+        node_labels[node_id] = label
+
+    nx.draw_networkx_labels(
+        G, pos,
+        labels=node_labels,
+        font_size=10,
+        font_weight='bold',
+        ax=ax
+    )
+
+    nx.draw_networkx_edge_labels(
+        G, pos,
+        edge_labels=edge_labels,
+        font_size=8,
+        bbox=dict(facecolor='white', edgecolor='none', alpha=0.9),
+        ax=ax
+    )
+
+    if max_airflow > 0:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('风量 (m³/s)', fontsize=12)
+
+    legend_patches = [
+        mpatches.Patch(color='#e74c3c', label='瓶颈分支(标红)'),
+        mpatches.Patch(color='#2ecc71', label='推荐冗余分支(虚线)'),
+        mpatches.Patch(color='red', label='扇风机')
+    ]
+    ax.legend(handles=legend_patches, loc='upper right', fontsize=10)
+
+    ax.set_title(
+        '推荐冗余路径网络拓扑图\n(瓶颈分支标红 / 冗余分支绿色虚线)',
+        fontsize=16,
+        fontweight='bold',
+        pad=20
+    )
+    ax.set_xlabel('X坐标', fontsize=12)
+    ax.set_ylabel('Y坐标', fontsize=12)
+    ax.axis('off')
+    ax.margins(0.1)
+
+    plt.tight_layout()
+
+    return fig
+

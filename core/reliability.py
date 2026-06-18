@@ -589,3 +589,529 @@ def export_reliability_report_to_json(
         report['critical_branches'] = result.critical_branches
 
     return json.dumps(report, indent=indent, ensure_ascii=False)
+
+
+@dataclass
+class RedundantBranchCandidate:
+    candidate_id: str
+    original_branch_id: int
+    from_node: int
+    to_node: int
+    length: float
+    area: float
+    perimeter: float
+    friction_coeff: float
+    local_coeff: float
+    estimated_cost: float
+    direction_note: str
+
+
+@dataclass
+class CandidateEvaluation:
+    candidate_id: str
+    original_branch_id: int
+    added_branch_params: Dict
+    reliability_before: float
+    reliability_after: float
+    reliability_gain: float
+    estimated_cost: float
+    benefit_cost_ratio: float
+    simulation_count: int
+
+
+@dataclass
+class GreedyStep:
+    step: int
+    added_candidate_id: Optional[str]
+    cumulative_cost: float
+    cumulative_reliability: float
+    reliability_increment: float
+    added_branch: Optional[Dict]
+
+
+@dataclass
+class RedundancyDesignResult:
+    bottleneck_branches: List[Dict]
+    candidate_evaluations: List[CandidateEvaluation]
+    top_candidates: List[CandidateEvaluation]
+    greedy_steps: List[GreedyStep]
+    final_reliability: float
+    total_cost: float
+    target_reliability: float
+    target_met: bool
+    recommended_branches: List[Dict]
+    base_reliability: float
+    random_seed: int
+
+
+def identify_bottleneck_branches(
+    network: VentilationNetwork,
+    critical_branches: Optional[List[Dict]] = None,
+    weak_branch_distribution: Optional[Dict[int, float]] = None,
+    reliability_heatmap: Optional[Dict] = None,
+    top_k: int = 5
+) -> List[Dict]:
+    bottleneck_scores: Dict[int, float] = {}
+
+    if critical_branches:
+        for cb in critical_branches:
+            bid = cb['branch_id']
+            score = cb.get('reliability_drop', 0) * 2.0
+            bottleneck_scores[bid] = bottleneck_scores.get(bid, 0) + score
+
+    if weak_branch_distribution:
+        for bid, freq in weak_branch_distribution.items():
+            bottleneck_scores[bid] = bottleneck_scores.get(bid, 0) + freq
+
+    if reliability_heatmap and 'reliability_drops' in reliability_heatmap:
+        branch_ids_hm = reliability_heatmap.get('branch_ids', [])
+        drops = reliability_heatmap['reliability_drops']
+        for i, bid in enumerate(branch_ids_hm):
+            if i < len(drops):
+                avg_drop = float(np.mean(drops[i]))
+                bottleneck_scores[bid] = bottleneck_scores.get(bid, 0) + avg_drop * 1.5
+
+    if not bottleneck_scores:
+        non_atm_branch_ids = [bid for bid in sorted(network.branches.keys())
+                              if not network.get_branch(bid).is_atmospheric]
+        for bid in non_atm_branch_ids:
+            bottleneck_scores[bid] = 0.01
+
+    sorted_bottlenecks = sorted(
+        bottleneck_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    result = []
+    for bid, score in sorted_bottlenecks[:top_k]:
+        branch = network.get_branch(bid)
+        if branch:
+            result.append({
+                'branch_id': bid,
+                'from_node': branch.from_node,
+                'to_node': branch.to_node,
+                'score': float(score),
+                'has_fan': branch.has_fan,
+                'is_atmospheric': branch.is_atmospheric
+            })
+
+    return result
+
+
+def generate_redundant_candidates(
+    network: VentilationNetwork,
+    bottleneck_branches: List[Dict],
+    area_shrink_ratio: float = 0.7,
+    length_increase_ratio: float = 1.2
+) -> List[RedundantBranchCandidate]:
+    candidates = []
+    existing_key_set = set()
+
+    for bid, branch in network.branches.items():
+        key1 = (branch.from_node, branch.to_node)
+        key2 = (branch.to_node, branch.from_node)
+        existing_key_set.add(key1)
+        existing_key_set.add(key2)
+
+    used_ids = set(network.branches.keys())
+    next_id = max(used_ids) + 1 if used_ids else 1
+
+    for bottleneck in bottleneck_branches:
+        bid = bottleneck['branch_id']
+        orig_branch = network.get_branch(bid)
+        if not orig_branch:
+            continue
+        if orig_branch.is_atmospheric:
+            continue
+
+        fn = orig_branch.from_node
+        tn = orig_branch.to_node
+        orig_len = orig_branch.length
+        orig_area = orig_branch.area
+        orig_perim = orig_branch.perimeter
+        orig_fric = orig_branch.friction_coeff
+        orig_loc = orig_branch.local_coeff
+
+        directions = [
+            (fn, tn, '同向'),
+            (tn, fn, '反向')
+        ]
+
+        for from_n, to_n, dir_note in directions:
+            if (from_n, to_n) in existing_key_set:
+                continue
+
+            new_len = orig_len * length_increase_ratio
+            new_area = orig_area * area_shrink_ratio
+            new_perim = orig_perim * (area_shrink_ratio ** 0.5)
+            cost_est = new_len * new_area
+
+            cand_id = f"RED_{bid}_{from_n}_{to_n}"
+            candidate = RedundantBranchCandidate(
+                candidate_id=cand_id,
+                original_branch_id=bid,
+                from_node=from_n,
+                to_node=to_n,
+                length=new_len,
+                area=new_area,
+                perimeter=new_perim,
+                friction_coeff=orig_fric,
+                local_coeff=orig_loc,
+                estimated_cost=cost_est,
+                direction_note=dir_note
+            )
+            candidates.append(candidate)
+            existing_key_set.add((from_n, to_n))
+
+    return candidates
+
+
+def evaluate_single_candidate(
+    base_network: VentilationNetwork,
+    candidate: RedundantBranchCandidate,
+    reliability_params: Dict,
+    n_simulations: int = 500,
+    fixed_seed: int = 12345,
+    tolerance: float = 0.001,
+    max_iterations: int = 500,
+    use_parallel: bool = True,
+    progress_callback: Optional[Callable[[int, int], None]] = None
+) -> CandidateEvaluation:
+    test_network = copy.deepcopy(base_network)
+
+    used_ids = set(test_network.branches.keys())
+    new_id = max(used_ids) + 1 if used_ids else 1
+
+    new_branch = Branch(
+        id=new_id,
+        from_node=candidate.from_node,
+        to_node=candidate.to_node,
+        length=candidate.length,
+        area=candidate.area,
+        perimeter=candidate.perimeter,
+        friction_coeff=candidate.friction_coeff,
+        local_coeff=candidate.local_coeff,
+        has_fan=False,
+        fan_params=None,
+        has_damper=False,
+        damper_resistance=0.0,
+        is_atmospheric=False
+    )
+    test_network.add_branch(new_branch)
+
+    workface_ids = reliability_params.get('workface_branch_ids', [])
+    branch_fail_prob = reliability_params.get('branch_failure_prob', 0.05)
+    fan_fail_prob = reliability_params.get('fan_failure_prob', 0.02)
+    min_q_thresh = reliability_params.get('min_airflow_threshold', 4.0)
+    res_mult = reliability_params.get('resistance_multiplier', 10.0)
+
+    result = run_monte_carlo_simulation(
+        network=test_network,
+        n_simulations=n_simulations,
+        workface_branch_ids=workface_ids,
+        min_airflow_threshold=min_q_thresh,
+        branch_failure_prob=branch_fail_prob,
+        fan_failure_prob=fan_fail_prob,
+        resistance_multiplier=res_mult,
+        random_seed=fixed_seed,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        use_parallel=use_parallel,
+        progress_callback=progress_callback
+    )
+
+    reliability_after = result.reliability
+    base_reliability = reliability_params.get('base_reliability', 0.0)
+    gain = max(0.0, reliability_after - base_reliability)
+    cost = candidate.estimated_cost
+    ratio = gain / cost if cost > 0 else 0.0
+
+    added_branch_params = {
+        'id': new_id,
+        'from_node': candidate.from_node,
+        'to_node': candidate.to_node,
+        'length': candidate.length,
+        'area': candidate.area,
+        'perimeter': candidate.perimeter,
+        'friction_coeff': candidate.friction_coeff,
+        'local_coeff': candidate.local_coeff,
+        'candidate_id': candidate.candidate_id,
+        'original_branch_id': candidate.original_branch_id,
+        'direction_note': candidate.direction_note
+    }
+
+    return CandidateEvaluation(
+        candidate_id=candidate.candidate_id,
+        original_branch_id=candidate.original_branch_id,
+        added_branch_params=added_branch_params,
+        reliability_before=base_reliability,
+        reliability_after=reliability_after,
+        reliability_gain=gain,
+        estimated_cost=cost,
+        benefit_cost_ratio=ratio,
+        simulation_count=n_simulations
+    )
+
+
+def evaluate_all_candidates(
+    base_network: VentilationNetwork,
+    candidates: List[RedundantBranchCandidate],
+    reliability_params: Dict,
+    n_simulations_per_candidate: int = 500,
+    fixed_seed: int = 12345,
+    use_parallel: bool = True,
+    overall_progress_callback: Optional[Callable[[int, int], None]] = None
+) -> List[CandidateEvaluation]:
+    evaluations = []
+    total_candidates = len(candidates)
+
+    for idx, candidate in enumerate(candidates, 1):
+        eval_result = evaluate_single_candidate(
+            base_network=base_network,
+            candidate=candidate,
+            reliability_params=reliability_params,
+            n_simulations=n_simulations_per_candidate,
+            fixed_seed=fixed_seed,
+            use_parallel=use_parallel
+        )
+        evaluations.append(eval_result)
+
+        if overall_progress_callback is not None:
+            overall_progress_callback(idx, total_candidates)
+
+    return evaluations
+
+
+def greedy_combine_redundancy(
+    base_network: VentilationNetwork,
+    candidate_evaluations: List[CandidateEvaluation],
+    reliability_params: Dict,
+    target_reliability: float,
+    max_branches: int = 5,
+    n_simulations: int = 500,
+    fixed_seed: int = 12345,
+    use_parallel: bool = True,
+    overall_progress_callback: Optional[Callable[[int, int], None]] = None
+) -> RedundancyDesignResult:
+    sorted_evals = sorted(
+        candidate_evaluations,
+        key=lambda x: x.benefit_cost_ratio,
+        reverse=True
+    )
+    top5 = sorted_evals[:5]
+
+    base_reliability = reliability_params.get('base_reliability', 0.0)
+    greedy_steps: List[GreedyStep] = [
+        GreedyStep(
+            step=0,
+            added_candidate_id=None,
+            cumulative_cost=0.0,
+            cumulative_reliability=base_reliability,
+            reliability_increment=0.0,
+            added_branch=None
+        )
+    ]
+
+    current_network = copy.deepcopy(base_network)
+    added_branches: List[Dict] = []
+    cumulative_cost = 0.0
+    current_reliability = base_reliability
+    available_evals = list(candidate_evaluations)
+    target_met = current_reliability >= target_reliability
+
+    workface_ids = reliability_params.get('workface_branch_ids', [])
+    branch_fail_prob = reliability_params.get('branch_failure_prob', 0.05)
+    fan_fail_prob = reliability_params.get('fan_failure_prob', 0.02)
+    min_q_thresh = reliability_params.get('min_airflow_threshold', 4.0)
+    res_mult = reliability_params.get('resistance_multiplier', 10.0)
+
+    max_steps = min(max_branches, len(available_evals))
+
+    for step_num in range(1, max_steps + 1):
+        if current_reliability >= target_reliability:
+            target_met = True
+            break
+        if not available_evals:
+            break
+
+        best_eval = None
+        best_gain = 0.0
+        best_test_reliability = 0.0
+
+        for cand_eval in available_evals:
+            test_network = copy.deepcopy(current_network)
+
+            used_ids = set(test_network.branches.keys())
+            new_id = max(used_ids) + 1 if used_ids else 1
+
+            branch_params = cand_eval.added_branch_params
+            new_branch = Branch(
+                id=new_id,
+                from_node=branch_params['from_node'],
+                to_node=branch_params['to_node'],
+                length=branch_params['length'],
+                area=branch_params['area'],
+                perimeter=branch_params['perimeter'],
+                friction_coeff=branch_params['friction_coeff'],
+                local_coeff=branch_params['local_coeff'],
+                has_fan=False,
+                fan_params=None,
+                has_damper=False,
+                damper_resistance=0.0,
+                is_atmospheric=False
+            )
+            test_network.add_branch(new_branch)
+
+            result = run_monte_carlo_simulation(
+                network=test_network,
+                n_simulations=n_simulations,
+                workface_branch_ids=workface_ids,
+                min_airflow_threshold=min_q_thresh,
+                branch_failure_prob=branch_fail_prob,
+                fan_failure_prob=fan_fail_prob,
+                resistance_multiplier=res_mult,
+                random_seed=fixed_seed,
+                tolerance=0.001,
+                max_iterations=500,
+                use_parallel=use_parallel
+            )
+
+            test_reliability = result.reliability
+            gain = max(0.0, test_reliability - current_reliability)
+
+            if gain > best_gain:
+                best_gain = gain
+                best_eval = cand_eval
+                best_test_reliability = test_reliability
+
+        if best_eval is None or best_gain <= 0:
+            break
+
+        used_ids = set(current_network.branches.keys())
+        new_id = max(used_ids) + 1 if used_ids else 1
+
+        branch_params_copy = dict(best_eval.added_branch_params)
+        branch_params_copy['id'] = new_id
+        new_branch = Branch(
+            id=new_id,
+            from_node=branch_params_copy['from_node'],
+            to_node=branch_params_copy['to_node'],
+            length=branch_params_copy['length'],
+            area=branch_params_copy['area'],
+            perimeter=branch_params_copy['perimeter'],
+            friction_coeff=branch_params_copy['friction_coeff'],
+            local_coeff=branch_params_copy['local_coeff'],
+            has_fan=False,
+            fan_params=None,
+            has_damper=False,
+            damper_resistance=0.0,
+            is_atmospheric=False
+        )
+        current_network.add_branch(new_branch)
+
+        added_branches.append(branch_params_copy)
+        cumulative_cost += best_eval.estimated_cost
+        current_reliability = best_test_reliability
+
+        step_record = GreedyStep(
+            step=step_num,
+            added_candidate_id=best_eval.candidate_id,
+            cumulative_cost=cumulative_cost,
+            cumulative_reliability=current_reliability,
+            reliability_increment=best_gain,
+            added_branch=branch_params_copy
+        )
+        greedy_steps.append(step_record)
+
+        available_evals = [e for e in available_evals if e.candidate_id != best_eval.candidate_id]
+
+        if overall_progress_callback is not None:
+            overall_progress_callback(step_num, max_steps)
+
+        if current_reliability >= target_reliability:
+            target_met = True
+            break
+
+    final_reliability = current_reliability
+    if final_reliability >= target_reliability:
+        target_met = True
+
+    bottleneck_branches_info = []
+    if reliability_params.get('bottleneck_branches'):
+        bottleneck_branches_info = reliability_params['bottleneck_branches']
+
+    result = RedundancyDesignResult(
+        bottleneck_branches=bottleneck_branches_info,
+        candidate_evaluations=sorted_evals,
+        top_candidates=top5,
+        greedy_steps=greedy_steps,
+        final_reliability=final_reliability,
+        total_cost=cumulative_cost,
+        target_reliability=target_reliability,
+        target_met=target_met,
+        recommended_branches=added_branches,
+        base_reliability=base_reliability,
+        random_seed=fixed_seed
+    )
+
+    return result
+
+
+def export_redundancy_design_to_json(
+    design_result: RedundancyDesignResult,
+    indent: int = 2
+) -> str:
+    recommended_with_details = []
+    for branch in design_result.recommended_branches:
+        rec = dict(branch)
+        cand_eval = next(
+            (e for e in design_result.candidate_evaluations
+             if e.candidate_id == branch.get('candidate_id')),
+            None
+        )
+        if cand_eval:
+            rec['reliability_gain'] = cand_eval.reliability_gain
+            rec['estimated_cost'] = cand_eval.estimated_cost
+            rec['benefit_cost_ratio'] = cand_eval.benefit_cost_ratio
+        recommended_with_details.append(rec)
+
+    report = {
+        'version': '1.0',
+        'analysis_type': 'redundancy_design',
+        'base_reliability': design_result.base_reliability,
+        'target_reliability': design_result.target_reliability,
+        'final_reliability': design_result.final_reliability,
+        'target_met': design_result.target_met,
+        'total_cost': design_result.total_cost,
+        'random_seed': design_result.random_seed,
+        'bottleneck_branches': design_result.bottleneck_branches,
+        'top_5_candidates': [
+            {
+                'candidate_id': e.candidate_id,
+                'original_branch_id': e.original_branch_id,
+                'added_branch_params': e.added_branch_params,
+                'reliability_before': e.reliability_before,
+                'reliability_after': e.reliability_after,
+                'reliability_gain': e.reliability_gain,
+                'estimated_cost': e.estimated_cost,
+                'benefit_cost_ratio': e.benefit_cost_ratio,
+                'simulation_count': e.simulation_count
+            }
+            for e in design_result.top_candidates
+        ],
+        'greedy_optimization_steps': [
+            {
+                'step': s.step,
+                'added_candidate_id': s.added_candidate_id,
+                'cumulative_cost': s.cumulative_cost,
+                'cumulative_reliability': s.cumulative_reliability,
+                'reliability_increment': s.reliability_increment,
+                'added_branch': s.added_branch
+            }
+            for s in design_result.greedy_steps
+        ],
+        'recommended_redundant_branches': recommended_with_details
+    }
+
+    return json.dumps(report, indent=indent, ensure_ascii=False)

@@ -42,6 +42,8 @@ from visualization.network_plot import (
     plot_airflow_distribution_histogram,
     plot_weak_branch_distribution,
     plot_critical_branches,
+    plot_redundancy_greedy_curve,
+    plot_network_with_redundancy,
 )
 from visualization.fan_plot import (
     plot_fan_operating_point,
@@ -64,6 +66,12 @@ from core.reliability import (
     identify_critical_branches,
     export_reliability_report_to_json,
     ReliabilityAnalysisResult,
+    identify_bottleneck_branches,
+    generate_redundant_candidates,
+    evaluate_all_candidates,
+    greedy_combine_redundancy,
+    export_redundancy_design_to_json,
+    RedundancyDesignResult,
 )
 
 st.set_page_config(
@@ -109,6 +117,10 @@ if 'reliability_critical' not in st.session_state:
     st.session_state.reliability_critical = None
 if 'reliability_params' not in st.session_state:
     st.session_state.reliability_params = None
+if 'redundancy_design_result' not in st.session_state:
+    st.session_state.redundancy_design_result = None
+if 'redundancy_params' not in st.session_state:
+    st.session_state.redundancy_params = None
 
 
 def load_sample_network():
@@ -1265,7 +1277,8 @@ def reliability_analysis_tab():
             '🔗 薄弱分支',
             '🔥 可靠度热力图',
             '🎯 关键路径',
-            '📋 详细数据'
+            '�️ 冗余设计',
+            '�📋 详细数据'
         ])
 
         with result_tabs[0]:
@@ -1341,6 +1354,414 @@ def reliability_analysis_tab():
                 st.info('未识别关键分支。可在参数设置中勾选"识别关键分支"后重新运行分析。')
 
         with result_tabs[4]:
+            st.subheader('🛠️ 冗余通风路径自动设计')
+
+            reliability_pct = result.reliability * 100
+
+            if st.session_state.redundancy_params is None:
+                st.session_state.redundancy_params = {
+                    'target_reliability': 0.95,
+                    'area_shrink_ratio': 0.7,
+                    'length_increase_ratio': 1.2,
+                    'n_simulations_per_candidate': 500,
+                    'max_redundant_branches': 5,
+                    'bottleneck_top_k': 5,
+                    'fixed_random_seed': 12345
+                }
+
+            red_params = st.session_state.redundancy_params
+
+            with st.expander('⚙️ 冗余设计参数设置', expanded=True):
+                rp_col1, rp_col2, rp_col3 = st.columns(3)
+                with rp_col1:
+                    target_reliability = st.slider(
+                        '目标可靠度',
+                        min_value=0.70,
+                        max_value=0.999,
+                        value=red_params['target_reliability'],
+                        step=0.005,
+                        format='%.3f',
+                        help='期望达到的系统可靠度目标值'
+                    )
+                    area_shrink_ratio = st.slider(
+                        '冗余巷道断面积缩小比例',
+                        min_value=0.4,
+                        max_value=0.9,
+                        value=red_params['area_shrink_ratio'],
+                        step=0.05,
+                        format='%.2f',
+                        help='新巷道断面积 = 原分支断面积 × 此比例'
+                    )
+                    n_sim_per_cand = st.number_input(
+                        '每个候选方案的蒙特卡洛次数',
+                        min_value=100,
+                        max_value=2000,
+                        value=red_params['n_simulations_per_candidate'],
+                        step=100,
+                        help='建议500次以上获得稳定结果'
+                    )
+                with rp_col2:
+                    length_increase_ratio = st.slider(
+                        '冗余巷道长度增加比例',
+                        min_value=1.0,
+                        max_value=2.0,
+                        value=red_params['length_increase_ratio'],
+                        step=0.05,
+                        format='%.2f',
+                        help='新巷道长度 = 原分支长度 × 此比例 (模拟绕行)'
+                    )
+                    bottleneck_top_k = st.slider(
+                        '瓶颈分支识别数量',
+                        min_value=2,
+                        max_value=10,
+                        value=red_params['bottleneck_top_k'],
+                        step=1,
+                        help='识别前K个最关键的瓶颈分支'
+                    )
+                    max_red_branches = st.slider(
+                        '贪心算法最多添加分支数',
+                        min_value=1,
+                        max_value=5,
+                        value=red_params['max_redundant_branches'],
+                        step=1,
+                        help='贪心组合优化过程最多添加的冗余分支数'
+                    )
+                with rp_col3:
+                    fixed_seed = st.number_input(
+                        '固定随机种子',
+                        min_value=0,
+                        max_value=999999,
+                        value=red_params['fixed_random_seed'],
+                        step=1,
+                        help='所有评估使用相同种子，保证结果可比性'
+                    )
+                    st.info(
+                        f'📊 **当前系统可靠度**: {reliability_pct:.1f}%\n\n'
+                        f'🎯 **目标可靠度**: {target_reliability * 100:.1f}%'
+                    )
+                    if reliability_pct >= target_reliability * 100:
+                        st.success('✅ 当前可靠度已达标，冗余设计为可选项。')
+                    else:
+                        gap = target_reliability * 100 - reliability_pct
+                        st.warning(f'⚠️ 当前可靠度低于目标，需提升约 {gap:.1f}%。')
+
+            red_params = {
+                'target_reliability': target_reliability,
+                'area_shrink_ratio': area_shrink_ratio,
+                'length_increase_ratio': length_increase_ratio,
+                'n_simulations_per_candidate': n_sim_per_cand,
+                'max_redundant_branches': max_red_branches,
+                'bottleneck_top_k': bottleneck_top_k,
+                'fixed_random_seed': fixed_seed
+            }
+            st.session_state.redundancy_params = red_params
+
+            st.divider()
+
+            run_redesign = st.button(
+                '🚀 开始冗余路径自动设计',
+                type='primary',
+                use_container_width=True,
+                help='将进行瓶颈识别、候选生成、方案评估和贪心组合优化'
+            )
+
+            if run_redesign:
+                st.session_state.redundancy_design_result = None
+
+                status_box = st.status('🔄 正在进行冗余路径设计...', expanded=True, state='running')
+                start_time = time.time()
+
+                try:
+                    overall_progress = status_box.progress(0.0, text='步骤1/4: 识别瓶颈分支...')
+
+                    critical_for_bottleneck = result.critical_branches if result.critical_branches else None
+                    weak_for_bottleneck = result.weak_branch_distribution if result.weak_branch_distribution else None
+                    heatmap_for_bottleneck = result.heatmap_data if result.heatmap_data else None
+
+                    bottleneck_branches = identify_bottleneck_branches(
+                        network=network,
+                        critical_branches=critical_for_bottleneck,
+                        weak_branch_distribution=weak_for_bottleneck,
+                        reliability_heatmap=heatmap_for_bottleneck,
+                        top_k=bottleneck_top_k
+                    )
+                    overall_progress.progress(0.15, text=f'✅ 步骤1完成: 识别出 {len(bottleneck_branches)} 个瓶颈分支')
+
+                    candidates = generate_redundant_candidates(
+                        network=network,
+                        bottleneck_branches=bottleneck_branches,
+                        area_shrink_ratio=area_shrink_ratio,
+                        length_increase_ratio=length_increase_ratio
+                    )
+                    overall_progress.progress(0.25, text=f'✅ 步骤2完成: 生成 {len(candidates)} 个候选冗余路径')
+
+                    if not candidates:
+                        status_box.update(state='error', label='❌ 未找到可用的冗余路径候选。可能所有瓶颈分支的起止节点之间已有其他分支。')
+                        st.error('未找到可用的冗余路径候选。请尝试调整瓶颈分支数量或检查网络拓扑。')
+                    else:
+                        rel_params_for_eval = {
+                            'base_reliability': result.reliability,
+                            'workface_branch_ids': result.parameters.get('workface_branch_ids', []),
+                            'branch_failure_prob': result.parameters.get('branch_failure_prob', 0.05),
+                            'fan_failure_prob': result.parameters.get('fan_failure_prob', 0.02),
+                            'min_airflow_threshold': result.parameters.get('min_airflow_threshold', 4.0),
+                            'resistance_multiplier': result.parameters.get('resistance_multiplier', 10.0),
+                            'bottleneck_branches': bottleneck_branches
+                        }
+
+                        phase2_start = 0.25
+                        phase2_end = 0.60
+                        total_evals = len(candidates)
+
+                        def eval_progress_cb(cur, total):
+                            frac = cur / total
+                            overall_progress.progress(
+                                phase2_start + (phase2_end - phase2_start) * frac,
+                                text=f'步骤3/4: 评估候选方案 ({cur}/{total}) - 每方案 {n_sim_per_cand} 次模拟...'
+                            )
+
+                        use_parallel = st.session_state.reliability_params.get('use_parallel', True) if st.session_state.reliability_params else True
+
+                        candidate_evaluations = evaluate_all_candidates(
+                            base_network=network,
+                            candidates=candidates,
+                            reliability_params=rel_params_for_eval,
+                            n_simulations_per_candidate=n_sim_per_cand,
+                            fixed_seed=fixed_seed,
+                            use_parallel=use_parallel,
+                            overall_progress_callback=eval_progress_cb
+                        )
+                        overall_progress.progress(0.60, text=f'✅ 步骤3完成: {len(candidate_evaluations)} 个候选方案评估完毕')
+
+                        phase3_start = 0.60
+                        phase3_end = 1.0
+
+                        def greedy_progress_cb(cur, total):
+                            frac = cur / total if total > 0 else 1.0
+                            overall_progress.progress(
+                                phase3_start + (phase3_end - phase3_start) * frac,
+                                text=f'步骤4/4: 贪心组合优化 (步骤 {cur}/{total})...'
+                            )
+
+                        design_result = greedy_combine_redundancy(
+                            base_network=network,
+                            candidate_evaluations=candidate_evaluations,
+                            reliability_params=rel_params_for_eval,
+                            target_reliability=target_reliability,
+                            max_branches=max_red_branches,
+                            n_simulations=n_sim_per_cand,
+                            fixed_seed=fixed_seed,
+                            use_parallel=use_parallel,
+                            overall_progress_callback=greedy_progress_cb
+                        )
+                        st.session_state.redundancy_design_result = design_result
+
+                        total_time = time.time() - start_time
+                        overall_progress.progress(1.0, text=f'🎉 全部完成! 总耗时: {total_time:.1f} 秒')
+                        status_box.update(state='complete', label=f'✅ 冗余设计完成! 总耗时: {total_time:.1f} 秒')
+
+                except Exception as e:
+                    status_box.update(state='error', label=f'❌ 冗余设计失败: {str(e)}')
+                    import traceback
+                    status_box.code(traceback.format_exc())
+
+            if st.session_state.redundancy_design_result is not None:
+                dr: RedundancyDesignResult = st.session_state.redundancy_design_result
+
+                st.divider()
+
+                red_metric_col1, red_metric_col2, red_metric_col3, red_metric_col4 = st.columns(4)
+                with red_metric_col1:
+                    final_pct = dr.final_reliability * 100
+                    target_pct = dr.target_reliability * 100
+                    if dr.target_met:
+                        delta_str = f'✅ 已达标'
+                        delta_color = 'normal'
+                    else:
+                        delta_str = f'未达标 (差{target_pct - final_pct:.1f}%)'
+                        delta_color = 'inverse'
+                    st.metric(
+                        '最终系统可靠度',
+                        f'{final_pct:.1f}%',
+                        delta=delta_str,
+                        delta_color=delta_color
+                    )
+                with red_metric_col2:
+                    gain_pct = (dr.final_reliability - dr.base_reliability) * 100
+                    st.metric(
+                        '可靠度提升',
+                        f'{gain_pct:+.1f}%',
+                        delta=f'从 {dr.base_reliability * 100:.1f}% 提升',
+                        delta_color='normal' if gain_pct > 0 else 'off'
+                    )
+                with red_metric_col3:
+                    st.metric(
+                        '推荐冗余分支数',
+                        f'{len(dr.recommended_branches)} 条',
+                        delta=f'最多 {dr.greedy_steps[-1].step if dr.greedy_steps else 0} 步',
+                    )
+                with red_metric_col4:
+                    st.metric(
+                        '累计成本估算',
+                        f'{dr.total_cost:.0f}',
+                        delta='长度×断面积',
+                        help='成本 ≈ Σ(新巷道长度 × 断面积)'
+                    )
+
+                st.divider()
+
+                red_subtabs = st.tabs([
+                    '🎯 瓶颈分支识别',
+                    '🏆 候选方案排名',
+                    '📈 贪心组合收益',
+                    '🌐 推荐拓扑图'
+                ])
+
+                with red_subtabs[0]:
+                    st.info('**单点故障瓶颈**: 这些分支一旦故障会导致系统可靠度大幅下降，是冗余设计优先针对的目标。')
+                    bottleneck_data = []
+                    bottleneck_ids = []
+                    for i, bn in enumerate(dr.bottleneck_branches, 1):
+                        bottleneck_ids.append(bn['branch_id'])
+                        bottleneck_data.append({
+                            '排名': i,
+                            '分支编号': bn['branch_id'],
+                            '起节点': bn['from_node'],
+                            '止节点': bn['to_node'],
+                            '关键度评分': f'{bn["score"]:.4f}',
+                            '含风机': '是' if bn.get('has_fan') else '否'
+                        })
+                    st.dataframe(pd.DataFrame(bottleneck_data), use_container_width=True, hide_index=True)
+
+                    bn_styler_data = pd.DataFrame(bottleneck_data).style.applymap(
+                        lambda _: 'background-color: #ffcccc; color: #c0392b; font-weight: bold',
+                        subset=['分支编号']
+                    )
+                    st.dataframe(bn_styler_data, use_container_width=True, hide_index=True)
+
+                with red_subtabs[1]:
+                    st.info(f'**候选方案排名**: 共 {len(dr.candidate_evaluations)} 个候选，按 可靠度提升/成本比 排序，显示前5个最优方案。所有评估均使用随机种子={dr.random_seed}。')
+
+                    rank_data = []
+                    for i, ce in enumerate(dr.top_candidates, 1):
+                        branch_params = ce.added_branch_params
+                        rank_data.append({
+                            '排名': i,
+                            '候选ID': ce.candidate_id,
+                            '针对瓶颈分支': ce.original_branch_id,
+                            '冗余路径': f'{branch_params["from_node"]}→{branch_params["to_node"]}',
+                            '方向': branch_params.get('direction_note', 'N/A'),
+                            '长度(m)': f'{branch_params["length"]:.1f}',
+                            '断面积(m²)': f'{branch_params["area"]:.2f}',
+                            '可靠度提升': f'{ce.reliability_gain * 100:.2f}%',
+                            '评估后可靠度': f'{ce.reliability_after * 100:.1f}%',
+                            '成本估算': f'{ce.estimated_cost:.0f}',
+                            '效益/成本比': f'{ce.benefit_cost_ratio:.6f}',
+                            '模拟次数': ce.simulation_count
+                        })
+                    st.dataframe(pd.DataFrame(rank_data), use_container_width=True, hide_index=True)
+
+                    with st.expander('📊 效益比排序详细图表', expanded=False):
+                        import matplotlib.pyplot as plt
+
+                        top_n = min(10, len(dr.candidate_evaluations))
+                        eval_for_plot = dr.candidate_evaluations[:top_n]
+                        labels = [f'候选{i+1}' for i in range(len(eval_for_plot))]
+                        gains = [e.reliability_gain * 100 for e in eval_for_plot]
+                        ratios = [e.benefit_cost_ratio * 1000 for e in eval_for_plot]
+
+                        fig, ax1 = plt.subplots(figsize=(12, 6))
+                        x = np.arange(len(labels))
+                        width = 0.35
+
+                        bars1 = ax1.bar(x - width/2, gains, width, label='可靠度提升(%)', color='#3498db', alpha=0.8)
+                        ax2 = ax1.twinx()
+                        bars2 = ax2.bar(x + width/2, ratios, width, label='效益成本比(×1000)', color='#e67e22', alpha=0.8)
+
+                        ax1.set_xlabel('候选方案', fontsize=11)
+                        ax1.set_ylabel('可靠度提升 (%)', fontsize=11, color='#3498db')
+                        ax2.set_ylabel('效益/成本比 (放大1000倍)', fontsize=11, color='#e67e22')
+                        ax1.set_xticks(x)
+                        ax1.set_xticklabels(labels, rotation=45, ha='right')
+                        ax1.set_title(f'前{top_n}个候选方案 可靠度提升 & 效益成本比', fontsize=13, fontweight='bold')
+
+                        lines1, labels1 = ax1.get_legend_handles_labels()
+                        lines2, labels2 = ax2.get_legend_handles_labels()
+                        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+                        ax1.grid(True, alpha=0.3, axis='y')
+                        plt.tight_layout()
+                        st.pyplot(fig, use_container_width=True)
+
+                with red_subtabs[2]:
+                    st.info('**贪心组合优化**: 逐步添加最优冗余分支，每一步选当前提升最大的方案，直到达标或候选用完。最多添加5条。')
+
+                    greedy_dicts = []
+                    for gs in dr.greedy_steps:
+                        greedy_dicts.append({
+                            'step': gs.step,
+                            'cumulative_cost': gs.cumulative_cost,
+                            'cumulative_reliability': gs.cumulative_reliability,
+                            'reliability_increment': gs.reliability_increment
+                        })
+                    fig_greedy = plot_redundancy_greedy_curve(greedy_dicts, dr.target_reliability)
+                    st.pyplot(fig_greedy, use_container_width=True)
+
+                    with st.expander('📋 贪心步骤详情', expanded=True):
+                        step_data = []
+                        for gs in dr.greedy_steps:
+                            added_branch_info = ''
+                            if gs.added_branch:
+                                ab = gs.added_branch
+                                added_branch_info = f'冗余{gs.step}: {ab["from_node"]}→{ab["to_node"]} (L={ab["length"]:.0f}m, A={ab["area"]:.2f}m²)'
+                            step_data.append({
+                                '步骤': gs.step,
+                                '添加候选': gs.added_candidate_id or '(初始)',
+                                '新增冗余分支': added_branch_info or '无(基准)',
+                                '本步提升': f'{gs.reliability_increment * 100:.2f}%' if gs.reliability_increment > 0 else '—',
+                                '累计可靠度': f'{gs.cumulative_reliability * 100:.2f}%',
+                                '累计成本': f'{gs.cumulative_cost:.0f}'
+                            })
+                        st.dataframe(pd.DataFrame(step_data), use_container_width=True, hide_index=True)
+
+                with red_subtabs[3]:
+                    st.info('**推荐冗余路径拓扑**: 红色=瓶颈分支，绿色虚线=推荐冗余巷道。')
+
+                    if dr.recommended_branches:
+                        fig_topology = plot_network_with_redundancy(
+                            network=network,
+                            recommended_branches=dr.recommended_branches,
+                            bottleneck_branch_ids=bottleneck_ids,
+                            show_airflow=True,
+                            show_pressure=True
+                        )
+                        st.pyplot(fig_topology, use_container_width=True)
+                    else:
+                        st.info('贪心算法未添加任何冗余分支。可能当前可靠度已达标，或没有能带来正向提升的候选方案。')
+
+                st.divider()
+                st.subheader('📥 导出冗余设计方案')
+
+                red_json_str = export_redundancy_design_to_json(dr)
+
+                red_exp_col1, red_exp_col2 = st.columns([3, 1])
+                with red_exp_col1:
+                    st.download_button(
+                        label='⬇️ 下载JSON格式冗余设计方案',
+                        data=red_json_str,
+                        file_name=f'redundancy_design_scheme_{int(time.time())}.json',
+                        mime='application/json',
+                        use_container_width=True,
+                        type='primary'
+                    )
+                with red_exp_col2:
+                    if st.button('🔄 清除冗余设计结果', use_container_width=True, key='clear_redesign'):
+                        st.session_state.redundancy_design_result = None
+                        st.rerun()
+
+                with st.expander('📄 预览JSON设计方案内容', expanded=False):
+                    st.code(red_json_str, language='json')
+
+        with result_tabs[5]:
             st.subheader('前20次模拟结果')
             sim_data = []
             for r in result.simulation_results[:20]:
