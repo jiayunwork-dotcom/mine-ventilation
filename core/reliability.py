@@ -706,16 +706,7 @@ def generate_redundant_candidates(
     length_increase_ratio: float = 1.2
 ) -> List[RedundantBranchCandidate]:
     candidates = []
-    existing_key_set = set()
-
-    for bid, branch in network.branches.items():
-        key1 = (branch.from_node, branch.to_node)
-        key2 = (branch.to_node, branch.from_node)
-        existing_key_set.add(key1)
-        existing_key_set.add(key2)
-
-    used_ids = set(network.branches.keys())
-    next_id = max(used_ids) + 1 if used_ids else 1
+    generated_key_set = set()
 
     for bottleneck in bottleneck_branches:
         bid = bottleneck['branch_id']
@@ -734,12 +725,13 @@ def generate_redundant_candidates(
         orig_loc = orig_branch.local_coeff
 
         directions = [
-            (fn, tn, '同向'),
-            (tn, fn, '反向')
+            (fn, tn, '同向并联'),
+            (tn, fn, '反向并联')
         ]
 
         for from_n, to_n, dir_note in directions:
-            if (from_n, to_n) in existing_key_set:
+            cand_key = (from_n, to_n)
+            if cand_key in generated_key_set:
                 continue
 
             new_len = orig_len * length_increase_ratio
@@ -762,7 +754,7 @@ def generate_redundant_candidates(
                 direction_note=dir_note
             )
             candidates.append(candidate)
-            existing_key_set.add((from_n, to_n))
+            generated_key_set.add(cand_key)
 
     return candidates
 
