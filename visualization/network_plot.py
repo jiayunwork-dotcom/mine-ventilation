@@ -276,3 +276,140 @@ def plot_airflow_distribution(
     plt.tight_layout()
 
     return fig
+
+
+def plot_time_series_airflows(
+    timestamps: List[float],
+    airflow_data: Dict[int, List[float]],
+    selected_branches: Optional[List[int]] = None,
+    figsize: Tuple[int, int] = (14, 8),
+    time_markers: Optional[List[float]] = None,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if selected_branches is None:
+        selected_branches = sorted(airflow_data.keys())
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(selected_branches), 10)))
+
+    for i, bid in enumerate(selected_branches):
+        if bid in airflow_data:
+            airflows = airflow_data[bid]
+            if len(airflows) == len(timestamps):
+                ax.plot(
+                    timestamps,
+                    airflows,
+                    label=f'分支 {bid}',
+                    color=colors[i % len(colors)],
+                    linewidth=2,
+                    marker=None if len(timestamps) > 50 else 'o',
+                    markersize=4,
+                    alpha=0.85
+                )
+
+    if time_markers:
+        for tm in time_markers:
+            ax.axvline(x=tm, color='red', linestyle='--', alpha=0.5, linewidth=1)
+
+    ax.set_xlabel('时间 (小时)', fontsize=12)
+    ax.set_ylabel('风量 (m³/s)', fontsize=12)
+    ax.set_title('各分支风量时间序列变化', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10, ncol=min(3, max(1, len(selected_branches) // 5 + 1)))
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis='both', labelsize=10)
+    ax.set_xlim(min(timestamps), max(timestamps))
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_time_series_pressures(
+    timestamps: List[float],
+    pressure_data: Dict[int, List[float]],
+    selected_nodes: Optional[List[int]] = None,
+    figsize: Tuple[int, int] = (14, 8),
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if selected_nodes is None:
+        selected_nodes = sorted(pressure_data.keys())
+
+    colors = plt.cm.Set1(np.linspace(0, 1, max(len(selected_nodes), 9)))
+
+    for i, nid in enumerate(selected_nodes):
+        if nid in pressure_data:
+            pressures = pressure_data[nid]
+            if len(pressures) == len(timestamps):
+                ax.plot(
+                    timestamps,
+                    pressures,
+                    label=f'节点 {nid}',
+                    color=colors[i % len(colors)],
+                    linewidth=2,
+                    marker=None if len(timestamps) > 50 else 's',
+                    markersize=4,
+                    alpha=0.85
+                )
+
+    ax.set_xlabel('时间 (小时)', fontsize=12)
+    ax.set_ylabel('风压 (Pa)', fontsize=12)
+    ax.set_title('各节点风压时间序列变化', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10, ncol=min(3, max(1, len(selected_nodes) // 5 + 1)))
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis='both', labelsize=10)
+    ax.set_xlim(min(timestamps), max(timestamps))
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_rule_preview(
+    rule,
+    total_hours: float = 24.0,
+    n_points: int = 200,
+    figsize: Tuple[int, int] = (10, 5),
+) -> plt.Figure:
+    from core.time_series import compute_parameter_factor, ChangeMode
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    times = np.linspace(0, total_hours, n_points)
+    factors = [compute_parameter_factor(rule, t) for t in times]
+
+    param_name = "阻力系数倍率" if rule.parameter_type.value == "resistance" else "风机转速倍率"
+    mode_names = {
+        ChangeMode.STEP: "阶跃变化",
+        ChangeMode.LINEAR: "线性变化",
+        ChangeMode.SINE: "正弦波动",
+    }
+    mode_name = mode_names.get(rule.mode, str(rule.mode.value))
+
+    ax.plot(times, factors, 'b-', linewidth=2.5, label=param_name)
+    ax.fill_between(times, factors, alpha=0.2, color='skyblue')
+
+    if rule.mode == ChangeMode.STEP:
+        ax.axvline(x=rule.start_time, color='red', linestyle='--', alpha=0.7, label=f'变化时刻: {rule.start_time}h', linewidth=1.5)
+    elif rule.mode == ChangeMode.LINEAR:
+        ax.axvspan(rule.start_time, rule.end_time, alpha=0.15, color='orange', label=f'变化区间')
+    elif rule.mode == ChangeMode.SINE:
+        for k in range(int(total_hours // rule.period) + 1):
+            phase_t = rule.phase + k * rule.period
+            if 0 <= phase_t <= total_hours:
+                ax.axvline(x=phase_t, color='green', linestyle=':', alpha=0.5, linewidth=1)
+
+    ax.set_xlabel('时间 (小时)', fontsize=12)
+    ax.set_ylabel(param_name, fontsize=12)
+    ax.set_title(
+        f'分支 {rule.branch_id} - {mode_name}曲线预览\n'
+        f'基准={rule.base_value:.3f}, 目标/幅值={rule.target_value if rule.mode != ChangeMode.SINE else rule.amplitude:.3f}',
+        fontsize=13,
+        fontweight='bold'
+    )
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, total_hours)
+    ax.tick_params(axis='both', labelsize=10)
+
+    plt.tight_layout()
+    return fig
+
