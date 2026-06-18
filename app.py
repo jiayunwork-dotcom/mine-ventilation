@@ -931,6 +931,15 @@ def reliability_analysis_tab():
     non_atm_branch_ids = [bid for bid in branch_ids if not network.get_branch(bid).is_atmospheric]
     fan_branch_ids = [b.id for b in network.get_fan_branches()]
 
+    def format_branch_label(bid):
+        br = network.get_branch(bid)
+        if not br:
+            return f'分支 {bid}'
+        label = f'分支 {bid}: {br.from_node}→{br.to_node}'
+        if bid in fan_branch_ids:
+            label += ' (风机)'
+        return label
+
     if st.session_state.reliability_params is None:
         default_workfaces = non_atm_branch_ids[-3:] if len(non_atm_branch_ids) >= 3 else non_atm_branch_ids
         st.session_state.reliability_params = {
@@ -954,12 +963,13 @@ def reliability_analysis_tab():
 
     with col_p1:
         n_simulations = st.number_input(
-            '模拟次数',
+            '蒙特卡洛模拟次数',
             min_value=100,
             max_value=10000,
             value=params['n_simulations'],
             step=100,
-            key='rel_n_sim'
+            key='rel_n_sim',
+            help='主模拟的次数，建议1000次以上获得稳定结果'
         )
         min_airflow_threshold = st.number_input(
             '最低通风量阈值 (m³/s)',
@@ -967,7 +977,8 @@ def reliability_analysis_tab():
             max_value=20.0,
             value=params['min_airflow_threshold'],
             step=0.5,
-            key='rel_min_q'
+            key='rel_min_q',
+            help='每个工作面分支必须满足的最低风量要求'
         )
         random_seed = st.number_input(
             '随机数种子',
@@ -975,7 +986,8 @@ def reliability_analysis_tab():
             max_value=99999,
             value=params['random_seed'],
             step=1,
-            key='rel_seed'
+            key='rel_seed',
+            help='固定种子可复现模拟结果'
         )
 
     with col_p2:
@@ -986,7 +998,8 @@ def reliability_analysis_tab():
             value=params['branch_failure_prob'],
             step=0.01,
             format='%.2f',
-            key='rel_branch_prob'
+            key='rel_branch_prob',
+            help='巷道发生冒顶/塌方等故障的概率'
         )
         fan_failure_prob = st.slider(
             '风机故障概率',
@@ -995,7 +1008,8 @@ def reliability_analysis_tab():
             value=params['fan_failure_prob'],
             step=0.01,
             format='%.2f',
-            key='rel_fan_prob'
+            key='rel_fan_prob',
+            help='扇风机发生停机故障的概率'
         )
         resistance_multiplier = st.number_input(
             '故障阻力倍增系数',
@@ -1003,36 +1017,53 @@ def reliability_analysis_tab():
             max_value=50.0,
             value=params['resistance_multiplier'],
             step=1.0,
-            key='rel_res_mult'
+            key='rel_res_mult',
+            help='分支故障后阻力变为正常值的多少倍'
         )
 
     with col_p3:
         use_parallel = st.checkbox(
             '使用多进程并行计算',
             value=params['use_parallel'],
-            key='rel_parallel'
+            key='rel_parallel',
+            help='开启可大幅加速模拟，建议保持开启'
         )
         generate_heatmap = st.checkbox(
-            '生成可靠度热力图',
+            '生成可靠度热力图 (约需10秒)',
             value=params['generate_heatmap'],
-            key='rel_heatmap'
+            key='rel_heatmap',
+            help='分析各分支对系统可靠度的影响程度'
         )
         identify_critical = st.checkbox(
-            '识别关键分支',
+            '识别关键分支 (约需5秒)',
             value=params['identify_critical'],
-            key='rel_critical'
+            key='rel_critical',
+            help='找出对系统可靠度影响最大的前3条分支'
         )
 
     st.subheader('🏭 工作面分支标记')
-    st.info('请选择需要检查最低通风量的工作面分支')
+    st.info('请从下方列表中选择需要检查最低通风量的工作面分支（显示格式：分支编号: 起节点→止节点）')
 
     workface_branch_ids = st.multiselect(
-        '选择工作面分支',
+        '选择工作面分支（可多选）',
         options=non_atm_branch_ids,
         default=params['workface_branch_ids'],
-        format_func=lambda x: f'分支 {x}' + (' (风机)' if x in fan_branch_ids else ''),
-        key='rel_workfaces'
+        format_func=format_branch_label,
+        key='rel_workfaces',
+        help='选择后，系统会检查这些分支的风量是否满足最低通风量要求'
     )
+
+    if workface_branch_ids:
+        st.write(f'✅ 已选择 {len(workface_branch_ids)} 个工作面分支:')
+        wf_df = pd.DataFrame([{
+            '分支编号': bid,
+            '起节点': network.get_branch(bid).from_node,
+            '止节点': network.get_branch(bid).to_node,
+            '长度 (m)': network.get_branch(bid).length,
+            '断面积 (m²)': network.get_branch(bid).area,
+            '扇风机': '是' if bid in fan_branch_ids else '否'
+        } for bid in workface_branch_ids])
+        st.dataframe(wf_df, use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -1061,83 +1092,123 @@ def reliability_analysis_tab():
             st.error('请至少选择一个工作面分支')
             return
 
-        progress_bar = st.progress(0.0, text='准备模拟...')
-        status_placeholder = st.empty()
-
+        status_box = st.status('🔄 正在进行可靠性分析...', expanded=True, state='running')
         start_time = time.time()
 
-        def progress_cb(cur, total):
-            pct = cur / total
-            progress_bar.progress(pct, text=f'蒙特卡洛模拟: {cur}/{total} 次')
-
         try:
-            with st.spinner('正在进行蒙特卡洛模拟...'):
-                result = run_monte_carlo_simulation(
-                    network=network,
-                    n_simulations=n_simulations,
-                    workface_branch_ids=workface_branch_ids,
-                    min_airflow_threshold=min_airflow_threshold,
-                    branch_failure_prob=branch_failure_prob,
-                    fan_failure_prob=fan_failure_prob,
-                    resistance_multiplier=resistance_multiplier,
-                    random_seed=random_seed,
-                    tolerance=0.001,
-                    max_iterations=500,
-                    use_parallel=use_parallel,
-                    progress_callback=progress_cb
-                )
+            overall_progress = status_box.progress(0.0, text='初始化中...')
+
+            n_phases = 1 + (1 if generate_heatmap else 0) + (1 if identify_critical else 0)
+            phase_idx = 0
+
+            overall_progress.progress(
+                phase_idx / n_phases + 0.05 / n_phases,
+                text=f'阶段 1/{n_phases}: 正在运行蒙特卡洛模拟 ({n_simulations} 次)...'
+            )
+
+            mc_progress = status_box.progress(0.0)
+
+            def progress_cb(cur, total):
+                mc_progress.progress(cur / total, text=f'蒙特卡洛模拟进度: {cur}/{total}')
+
+            result = run_monte_carlo_simulation(
+                network=network,
+                n_simulations=n_simulations,
+                workface_branch_ids=workface_branch_ids,
+                min_airflow_threshold=min_airflow_threshold,
+                branch_failure_prob=branch_failure_prob,
+                fan_failure_prob=fan_failure_prob,
+                resistance_multiplier=resistance_multiplier,
+                random_seed=random_seed,
+                tolerance=0.001,
+                max_iterations=500,
+                use_parallel=use_parallel,
+                progress_callback=progress_cb
+            )
             st.session_state.reliability_result = result
 
-            if generate_heatmap:
-                def heatmap_progress_cb(cur, total):
-                    pct = cur / total
-                    progress_bar.progress(pct, text=f'生成热力图: {cur}/{total} 点')
+            phase_idx += 1
+            overall_progress.progress(
+                phase_idx / n_phases,
+                text=f'✅ 蒙特卡洛模拟完成 (可靠度: {result.reliability*100:.1f}%)'
+            )
 
-                with st.spinner('正在生成可靠度热力图...'):
-                    heatmap_data = generate_reliability_heatmap(
-                        network=network,
-                        workface_branch_ids=workface_branch_ids,
-                        min_airflow_threshold=min_airflow_threshold,
-                        resistance_multiplier=resistance_multiplier,
-                        random_seed=random_seed,
-                        n_simulations_per_point=300,
-                        use_parallel=use_parallel,
-                        progress_callback=heatmap_progress_cb
-                    )
+            if generate_heatmap:
+                non_atm = len([bid for bid in network.branches.keys()
+                              if not network.get_branch(bid).is_atmospheric])
+                total_heatmap_points = non_atm * 5
+                overall_progress.progress(
+                    phase_idx / n_phases + 0.05 / n_phases,
+                    text=f'阶段 {phase_idx + 1}/{n_phases}: 正在生成可靠度热力图 ({non_atm} 分支 × 5 概率点 = {total_heatmap_points} 点)...'
+                )
+                hm_progress = status_box.progress(0.0)
+
+                def heatmap_progress_cb(cur, total):
+                    hm_progress.progress(cur / total, text=f'热力图计算进度: {cur}/{total} 点')
+
+                heatmap_start = time.time()
+                heatmap_data = generate_reliability_heatmap(
+                    network=network,
+                    workface_branch_ids=workface_branch_ids,
+                    min_airflow_threshold=min_airflow_threshold,
+                    resistance_multiplier=resistance_multiplier,
+                    random_seed=random_seed,
+                    n_simulations_per_point=100,
+                    use_parallel=use_parallel,
+                    progress_callback=heatmap_progress_cb
+                )
                 result.heatmap_data = heatmap_data
                 st.session_state.reliability_heatmap = heatmap_data
 
-            if identify_critical:
-                def critical_progress_cb(cur, total):
-                    pct = cur / total
-                    progress_bar.progress(pct, text=f'识别关键分支: {cur}/{total} 分支')
+                phase_idx += 1
+                overall_progress.progress(
+                    phase_idx / n_phases,
+                    text=f'✅ 热力图生成完成 (耗时: {time.time() - heatmap_start:.1f} 秒)'
+                )
 
-                with st.spinner('正在识别关键分支...'):
-                    critical_branches = identify_critical_branches(
-                        network=network,
-                        workface_branch_ids=workface_branch_ids,
-                        min_airflow_threshold=min_airflow_threshold,
-                        base_branch_failure_prob=branch_failure_prob,
-                        fan_failure_prob=fan_failure_prob,
-                        resistance_multiplier=resistance_multiplier,
-                        random_seed=random_seed,
-                        n_simulations_per_branch=500,
-                        top_k=3,
-                        use_parallel=use_parallel,
-                        progress_callback=critical_progress_cb
-                    )
+            if identify_critical:
+                non_atm = len([bid for bid in network.branches.keys()
+                              if not network.get_branch(bid).is_atmospheric])
+                overall_progress.progress(
+                    phase_idx / n_phases + 0.05 / n_phases,
+                    text=f'阶段 {phase_idx + 1}/{n_phases}: 正在识别关键分支 ({non_atm} 条分支, 每条 200 次模拟)...'
+                )
+                crit_progress = status_box.progress(0.0)
+
+                def critical_progress_cb(cur, total):
+                    crit_progress.progress(cur / total, text=f'关键分支识别进度: {cur}/{total}')
+
+                critical_start = time.time()
+                critical_branches = identify_critical_branches(
+                    network=network,
+                    workface_branch_ids=workface_branch_ids,
+                    min_airflow_threshold=min_airflow_threshold,
+                    base_branch_failure_prob=branch_failure_prob,
+                    fan_failure_prob=fan_failure_prob,
+                    resistance_multiplier=resistance_multiplier,
+                    random_seed=random_seed,
+                    n_simulations_per_branch=200,
+                    top_k=3,
+                    use_parallel=use_parallel,
+                    progress_callback=critical_progress_cb
+                )
                 result.critical_branches = critical_branches
                 st.session_state.reliability_critical = critical_branches
 
+                phase_idx += 1
+                overall_progress.progress(
+                    phase_idx / n_phases,
+                    text=f'✅ 关键分支识别完成 (耗时: {time.time() - critical_start:.1f} 秒)'
+                )
+
             total_time = time.time() - start_time
-            progress_bar.progress(1.0, text=f'✅ 分析完成! 总耗时: {total_time:.2f} 秒')
-            status_placeholder.success(f'分析完成！总耗时: {total_time:.2f} 秒')
+            overall_progress.progress(1.0, text=f'🎉 全部分析完成! 总耗时: {total_time:.2f} 秒')
+            status_box.update(state='complete', label=f'✅ 分析完成! 总耗时: {total_time:.2f} 秒')
 
         except Exception as e:
-            st.error(f'分析失败: {str(e)}')
+            status_box.update(state='error', label=f'❌ 分析失败: {str(e)}')
             import traceback
-            st.code(traceback.format_exc())
-            progress_bar.empty()
+            status_box.code(traceback.format_exc())
             return
 
     if st.session_state.reliability_result is not None:

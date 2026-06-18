@@ -328,7 +328,7 @@ def generate_reliability_heatmap(
     fan_failure_prob: float = 0.02,
     resistance_multiplier: float = 10.0,
     random_seed: Optional[int] = 42,
-    n_simulations_per_point: int = 300,
+    n_simulations_per_point: int = 80,
     tolerance: float = 0.001,
     max_iterations: int = 500,
     use_parallel: bool = True,
@@ -337,7 +337,7 @@ def generate_reliability_heatmap(
     branch_ids = sorted([bid for bid in network.branches.keys()
                         if not network.get_branch(bid).is_atmospheric])
 
-    failure_probs = np.arange(0.01, 0.21, 0.02)
+    failure_probs = np.array([0.01, 0.05, 0.10, 0.15, 0.20])
 
     base_result = run_monte_carlo_simulation(
         network=network,
@@ -354,7 +354,6 @@ def generate_reliability_heatmap(
     base_reliability = base_result.reliability
 
     n_points = len(branch_ids) * len(failure_probs)
-    current_point = 0
 
     heatmap_data = {
         'branch_ids': branch_ids,
@@ -363,32 +362,71 @@ def generate_reliability_heatmap(
         'base_reliability': base_reliability
     }
 
-    for i, bid in enumerate(branch_ids):
-        for j, fp in enumerate(failure_probs):
-            branch_probs = {b: 0.0 for b in branch_ids}
-            branch_probs[bid] = fp
+    all_args = []
+    scenario_index_map = []
 
-            result = run_monte_carlo_simulation(
+    for i, bid in enumerate(branch_ids):
+        branch_specific_seed = (random_seed or 42) + bid * 1000
+        for j, fp in enumerate(failure_probs):
+            scenarios = generate_failure_scenarios(
                 network=network,
                 n_simulations=n_simulations_per_point,
-                workface_branch_ids=workface_branch_ids,
-                min_airflow_threshold=min_airflow_threshold,
                 branch_failure_prob=0.0,
                 fan_failure_prob=0.0,
-                branch_failure_probs=branch_probs,
+                branch_failure_probs={b: (fp if b == bid else 0.0) for b in branch_ids},
                 resistance_multiplier=resistance_multiplier,
-                random_seed=random_seed,
-                tolerance=tolerance,
-                max_iterations=max_iterations,
-                use_parallel=use_parallel
+                random_seed=branch_specific_seed + j
             )
+            for scenario in scenarios:
+                all_args.append((
+                    network, scenario, workface_branch_ids,
+                    min_airflow_threshold, tolerance, max_iterations
+                ))
+                scenario_index_map.append((i, j))
 
-            reliability_drop = base_reliability - result.reliability
-            heatmap_data['reliability_drops'][i, j] = reliability_drop
+    total_sims = len(all_args)
+    all_sim_results = []
 
-            current_point += 1
-            if progress_callback is not None:
-                progress_callback(current_point, n_points)
+    if use_parallel:
+        n_proc = min(cpu_count(), 8)
+        batch_size = max(1, total_sims // 20)
+        current_count = 0
+        with Pool(processes=n_proc) as pool:
+            for batch_start in range(0, total_sims, batch_size):
+                batch_end = min(batch_start + batch_size, total_sims)
+                batch = all_args[batch_start:batch_end]
+                batch_results = pool.map(run_single_simulation, batch)
+                all_sim_results.extend(batch_results)
+                current_count = batch_end
+                if progress_callback is not None:
+                    progress = int((current_count / total_sims) * n_points)
+                    progress_callback(max(1, min(progress, n_points)), n_points)
+    else:
+        for idx, args in enumerate(all_args, 1):
+            all_sim_results.append(run_single_simulation(args))
+            if idx % 100 == 0 or idx == total_sims:
+                if progress_callback is not None:
+                    progress = int((idx / total_sims) * n_points)
+                    progress_callback(max(1, min(progress, n_points)), n_points)
+
+    valid_counts = np.zeros((len(branch_ids), len(failure_probs)), dtype=int)
+    total_counts = np.zeros((len(branch_ids), len(failure_probs)), dtype=int)
+
+    for idx, sim_result in enumerate(all_sim_results):
+        i, j = scenario_index_map[idx]
+        total_counts[i, j] += 1
+        if sim_result.is_valid and sim_result.converged:
+            valid_counts[i, j] += 1
+
+    for i in range(len(branch_ids)):
+        for j in range(len(failure_probs)):
+            if total_counts[i, j] > 0:
+                reliability = valid_counts[i, j] / total_counts[i, j]
+                reliability_drop = max(0.0, base_reliability - reliability)
+                heatmap_data['reliability_drops'][i, j] = reliability_drop
+
+    if progress_callback is not None:
+        progress_callback(n_points, n_points)
 
     heatmap_data['reliability_drops'] = heatmap_data['reliability_drops'].tolist()
 
@@ -403,7 +441,7 @@ def identify_critical_branches(
     fan_failure_prob: float = 0.02,
     resistance_multiplier: float = 10.0,
     random_seed: Optional[int] = 42,
-    n_simulations_per_branch: int = 500,
+    n_simulations_per_branch: int = 200,
     top_k: int = 3,
     tolerance: float = 0.001,
     max_iterations: int = 500,
@@ -427,39 +465,83 @@ def identify_critical_branches(
     )
     base_reliability = base_result.reliability
 
-    branch_impact = []
     n_branches = len(branch_ids)
+    all_args = []
+    branch_index_map = []
 
     for i, bid in enumerate(branch_ids):
+        branch_specific_seed = (random_seed or 42) + bid * 2000
         branch_probs = {b: base_branch_failure_prob for b in branch_ids}
         branch_probs[bid] = 1.0
 
-        result = run_monte_carlo_simulation(
+        scenarios = generate_failure_scenarios(
             network=network,
             n_simulations=n_simulations_per_branch,
-            workface_branch_ids=workface_branch_ids,
-            min_airflow_threshold=min_airflow_threshold,
             branch_failure_prob=base_branch_failure_prob,
             fan_failure_prob=fan_failure_prob,
             branch_failure_probs=branch_probs,
             resistance_multiplier=resistance_multiplier,
-            random_seed=random_seed,
-            tolerance=tolerance,
-            max_iterations=max_iterations,
-            use_parallel=use_parallel
+            random_seed=branch_specific_seed
         )
 
-        reliability_drop = base_reliability - result.reliability
+        for scenario in scenarios:
+            all_args.append((
+                network, scenario, workface_branch_ids,
+                min_airflow_threshold, tolerance, max_iterations
+            ))
+            branch_index_map.append(i)
+
+    total_sims = len(all_args)
+    all_sim_results = []
+
+    if use_parallel:
+        n_proc = min(cpu_count(), 8)
+        batch_size = max(1, total_sims // max(n_branches, 1))
+        with Pool(processes=n_proc) as pool:
+            processed = 0
+            for batch_start in range(0, total_sims, batch_size):
+                batch_end = min(batch_start + batch_size, total_sims)
+                batch = all_args[batch_start:batch_end]
+                batch_results = pool.map(run_single_simulation, batch)
+                all_sim_results.extend(batch_results)
+                processed = batch_end
+                if progress_callback is not None:
+                    progress = int((processed / total_sims) * n_branches)
+                    progress_callback(max(1, min(progress, n_branches)), n_branches)
+    else:
+        for idx, args in enumerate(all_args, 1):
+            all_sim_results.append(run_single_simulation(args))
+            if idx % 50 == 0 or idx == total_sims:
+                if progress_callback is not None:
+                    progress = int((idx / total_sims) * n_branches)
+                    progress_callback(max(1, min(progress, n_branches)), n_branches)
+
+    valid_counts = np.zeros(n_branches, dtype=int)
+    total_counts = np.zeros(n_branches, dtype=int)
+
+    for idx, sim_result in enumerate(all_sim_results):
+        branch_idx = branch_index_map[idx]
+        total_counts[branch_idx] += 1
+        if sim_result.is_valid and sim_result.converged:
+            valid_counts[branch_idx] += 1
+
+    branch_impact = []
+    for i, bid in enumerate(branch_ids):
+        if total_counts[i] > 0:
+            reliability = valid_counts[i] / total_counts[i]
+        else:
+            reliability = 0.0
+        reliability_drop = max(0.0, base_reliability - reliability)
         branch_impact.append({
             'branch_id': bid,
             'base_reliability': base_reliability,
-            'branch_failure_reliability': result.reliability,
+            'branch_failure_reliability': reliability,
             'reliability_drop': reliability_drop,
-            'failure_count': result.total_simulations - result.valid_count
+            'failure_count': int(total_counts[i] - valid_counts[i])
         })
 
-        if progress_callback is not None:
-            progress_callback(i + 1, n_branches)
+    if progress_callback is not None:
+        progress_callback(n_branches, n_branches)
 
     branch_impact.sort(key=lambda x: x['reliability_drop'], reverse=True)
 
