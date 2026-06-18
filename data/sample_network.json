@@ -1,0 +1,132 @@
+{
+  "nodes": [
+    {"id": 1, "elevation": 0.0, "temperature": 15.0},
+    {"id": 2, "elevation": 100.0, "temperature": 18.0},
+    {"id": 3, "elevation": 100.0, "temperature": 18.0},
+    {"id": 4, "elevation": 200.0, "temperature": 20.0},
+    {"id": 5, "elevation": 200.0, "temperature": 20.0},
+    {"id": 6, "elevation": 300.0, "temperature": 22.0}
+  ],
+  "branches": [
+    {
+      "id": 1,
+      "from_node": 1,
+      "to_node": 2,
+      "length": 500.0,
+      "area": 10.0,
+      "perimeter": 13.0,
+      "friction_coeff": 0.012,
+      "local_coeff": 0.5,
+      "has_fan": true,
+      "fan_params": {
+        "a": 500.0,
+        "b": -2.5,
+        "c": -0.005,
+        "design_q": 30.0,
+        "efficiency": 0.75,
+        "efficiency_range": [0.7, 1.1]
+      },
+      "has_damper": false
+    },
+    {
+      "id": 2,
+      "from_node": 1,
+      "to_node": 3,
+      "length": 450.0,
+      "area": 8.0,
+      "perimeter": 11.0,
+      "friction_coeff": 0.015,
+      "local_coeff": 0.3,
+      "has_fan": false,
+      "has_damper": true,
+      "damper_resistance": 0.02
+    },
+    {
+      "id": 3,
+      "from_node": 2,
+      "to_node": 4,
+      "length": 600.0,
+      "area": 12.0,
+      "perimeter": 14.0,
+      "friction_coeff": 0.010,
+      "local_coeff": 0.2,
+      "has_fan": false,
+      "has_damper": false
+    },
+    {
+      "id": 4,
+      "from_node": 3,
+      "to_node": 5,
+      "length": 550.0,
+      "area": 9.0,
+      "perimeter": 12.0,
+      "friction_coeff": 0.013,
+      "local_coeff": 0.4,
+      "has_fan": false,
+      "has_damper": true,
+      "damper_resistance": 0.01
+    },
+    {
+      "id": 5,
+      "from_node": 4,
+      "to_node": 6,
+      "length": 400.0,
+      "area": 10.0,
+      "perimeter": 13.0,
+      "friction_coeff": 0.012,
+      "local_coeff": 0.3,
+      "has_fan": false,
+      "has_damper": false
+    },
+    {
+      "id": 6,
+      "from_node": 5,
+      "to_node": 6,
+      "length": 380.0,
+      "area": 8.5,
+      "perimeter": 11.5,
+      "friction_coeff": 0.014,
+      "local_coeff": 0.25,
+      "has_fan": false,
+      "has_damper": false
+    },
+    {
+      "id": 7,
+      "from_node": 2,
+      "to_node": 3,
+      "length": 200.0,
+      "area": 6.0,
+      "perimeter": 9.5,
+      "friction_coeff": 0.016,
+      "local_coeff": 1.0,
+      "has_fan": false,
+      "has_damper": true,
+      "damper_resistance": 0.05
+    },
+    {
+      "id": 8,
+      "from_node": 4,
+      "to_node": 5,
+      "length": 250.0,
+      "area": 7.0,
+      "perimeter": 10.0,
+      "friction_coeff": 0.015,
+      "local_coeff": 0.8,
+      "has_fan": false,
+      "has_damper": false
+    },
+    {
+      "id": 9,
+      "from_node": 6,
+      "to_node": 1,
+      "length": 100.0,
+      "area": 100.0,
+      "perimeter": 40.0,
+      "friction_coeff": 0.0,
+      "local_coeff": 0.0,
+      "has_fan": false,
+      "has_damper": false,
+      "is_atmospheric": true
+    }
+  ]
+}
