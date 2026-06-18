@@ -8,6 +8,7 @@ import time
 import os
 import sys
 import tempfile
+import copy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1842,6 +1843,8 @@ def genetic_optimization_tab():
     non_atm_branch_ids = [bid for bid in branch_ids if not network.get_branch(bid).is_atmospheric]
     fan_branch_ids = [b.id for b in network.get_fan_branches()]
     damper_branch_ids = [b.id for b in network.get_damper_branches()]
+    workface_candidate_ids = [bid for bid in non_atm_branch_ids
+                            if bid not in fan_branch_ids and bid not in damper_branch_ids]
     n_decision_vars = len(fan_branch_ids) + len(damper_branch_ids)
 
     def format_branch_label(bid):
@@ -1861,7 +1864,6 @@ def genetic_optimization_tab():
         return
 
     if st.session_state.ga_params is None:
-        default_workfaces = non_atm_branch_ids[-3:] if len(non_atm_branch_ids) >= 3 else non_atm_branch_ids
         st.session_state.ga_params = {
             'population_size': 50,
             'max_generations': 100,
@@ -1882,7 +1884,7 @@ def genetic_optimization_tab():
             'max_iterations': 500,
             'random_seed': 42,
         }
-        st.session_state.ga_workface_ids = default_workfaces
+        st.session_state.ga_workface_ids = []
 
     params = st.session_state.ga_params
 
@@ -2010,18 +2012,22 @@ def genetic_optimization_tab():
 
     st.divider()
     st.subheader('🏭 工作面分支标记')
-    st.info('请从下方列表中选择需要检查最低通风量的工作面分支（显示格式：分支编号: 起节点→止节点）')
+    st.info('请从下方列表中选择需要检查最低通风量的工作面分支（已自动排除扇风机和调节风门分支）')
 
-    default_wf = st.session_state.ga_workface_ids if st.session_state.ga_workface_ids else []
-    valid_defaults = [wf for wf in default_wf if wf in non_atm_branch_ids]
-    workface_branch_ids = st.multiselect(
-        '选择工作面分支（可多选，至少选1个）',
-        options=non_atm_branch_ids,
-        default=valid_defaults if valid_defaults else non_atm_branch_ids[:3],
-        format_func=format_branch_label,
-        key='ga_workfaces',
-        help='选择后，系统会检查这些分支的风量是否满足最低通风量要求'
-    )
+    if not workface_candidate_ids:
+        st.warning('⚠️ 当前网络中没有可作为工作面的普通巷道分支（非风机、非风门、非大气）')
+        workface_branch_ids = []
+    else:
+        default_wf = st.session_state.ga_workface_ids if st.session_state.ga_workface_ids else []
+        valid_defaults = [wf for wf in default_wf if wf in workface_candidate_ids]
+        workface_branch_ids = st.multiselect(
+            '选择工作面分支（可多选，至少选1个）',
+            options=workface_candidate_ids,
+            default=valid_defaults,
+            format_func=format_branch_label,
+            key='ga_workfaces',
+            help='选择后，系统会检查这些分支的风量是否满足最低通风量要求'
+        )
     st.session_state.ga_workface_ids = workface_branch_ids
 
     if workface_branch_ids:
@@ -2144,16 +2150,24 @@ def genetic_optimization_tab():
             st.session_state.ga_result = result
 
             total_time = time.time() - start_time
+            status_box.empty()
             if result.success:
                 status_box.update(
                     state='complete',
-                    label=f'✅ 优化完成! 总耗时: {total_time:.2f} 秒 | 节能: {result.energy_saving_percent:.1f}%'
+                    expanded=False,
+                    label=f'✅ 优化完成! 总耗时: {total_time:.2f} 秒 | 节能: {result.energy_saving_percent:.1f}% | 正在加载结果...'
                 )
             else:
-                status_box.update(state='error', label=f'❌ 优化失败: {result.message}')
+                status_box.update(
+                    state='error',
+                    expanded=True,
+                    label=f'❌ 优化失败: {result.message}'
+                )
+            time.sleep(0.5)
+            st.rerun()
 
         except Exception as e:
-            status_box.update(state='error', label=f'❌ 优化异常: {str(e)}')
+            status_box.update(state='error', label=f'❌ 优化异常: {str(e)}', expanded=True)
             import traceback
             status_box.code(traceback.format_exc())
 
