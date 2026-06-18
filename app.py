@@ -73,6 +73,19 @@ from core.reliability import (
     export_redundancy_design_to_json,
     RedundancyDesignResult,
 )
+from core.genetic_optimization import (
+    run_genetic_optimization,
+    GAParameters,
+    GAOptimizationResult,
+    export_ga_result_to_json,
+)
+from visualization.ga_plot import (
+    plot_ga_convergence_curve,
+    plot_ga_radar_chart,
+    plot_ga_airflow_comparison,
+    plot_ga_decision_variables_bar,
+    plot_ga_power_comparison,
+)
 
 st.set_page_config(
     page_title='矿井通风网络模拟系统',
@@ -121,6 +134,12 @@ if 'redundancy_design_result' not in st.session_state:
     st.session_state.redundancy_design_result = None
 if 'redundancy_params' not in st.session_state:
     st.session_state.redundancy_params = None
+if 'ga_result' not in st.session_state:
+    st.session_state.ga_result = None
+if 'ga_params' not in st.session_state:
+    st.session_state.ga_params = None
+if 'ga_workface_ids' not in st.session_state:
+    st.session_state.ga_workface_ids = None
 
 
 def load_sample_network():
@@ -1803,6 +1822,643 @@ def reliability_analysis_tab():
             st.code(json_str, language='json')
 
 
+def genetic_optimization_tab():
+    st.header('🧬 遗传算法优化')
+
+    if st.session_state.network is None:
+        st.warning('请先在"网络定义"模块中定义或加载通风网络')
+        return
+
+    network = st.session_state.network
+    is_valid, errors = network.validate()
+
+    if not is_valid:
+        st.error('网络存在拓扑问题，无法进行优化：')
+        for error in errors:
+            st.write(f'  - {error}')
+        return
+
+    branch_ids = sorted(network.branches.keys())
+    non_atm_branch_ids = [bid for bid in branch_ids if not network.get_branch(bid).is_atmospheric]
+    fan_branch_ids = [b.id for b in network.get_fan_branches()]
+    damper_branch_ids = [b.id for b in network.get_damper_branches()]
+    n_decision_vars = len(fan_branch_ids) + len(damper_branch_ids)
+
+    def format_branch_label(bid):
+        br = network.get_branch(bid)
+        if not br:
+            return f'分支 {bid}'
+        label = f'分支 {bid}: {br.from_node}→{br.to_node}'
+        if bid in fan_branch_ids:
+            label += ' (风机)'
+        if bid in damper_branch_ids:
+            label += ' (风门)'
+        return label
+
+    if n_decision_vars == 0:
+        st.error('❌ 网络中没有扇风机或调节风门，无法进行优化。请在网络中至少添加一个扇风机或调节风门。')
+        st.info(f'当前网络: {len(fan_branch_ids)} 个扇风机, {len(damper_branch_ids)} 个调节风门')
+        return
+
+    if st.session_state.ga_params is None:
+        default_workfaces = non_atm_branch_ids[-3:] if len(non_atm_branch_ids) >= 3 else non_atm_branch_ids
+        st.session_state.ga_params = {
+            'population_size': 50,
+            'max_generations': 100,
+            'crossover_prob': 0.8,
+            'mutation_prob': 0.1,
+            'elitism_count': 2,
+            'penalty_coefficient': 10000.0,
+            'min_airflow_threshold': 4.0,
+            'tournament_size': 3,
+            'sbx_eta': 20.0,
+            'pm_eta': 20.0,
+            'convergence_generations': 20,
+            'convergence_improvement': 0.001,
+            'fan_speed_min': 0.5,
+            'fan_speed_max': 1.2,
+            'damper_max_mult': 50.0,
+            'tolerance': 0.001,
+            'max_iterations': 500,
+            'random_seed': 42,
+        }
+        st.session_state.ga_workface_ids = default_workfaces
+
+    params = st.session_state.ga_params
+
+    st.subheader('⚙️ 遗传算法参数设置')
+
+    param_col1, param_col2, param_col3 = st.columns(3)
+
+    with param_col1:
+        st.markdown('##### 🧬 基本进化参数')
+        population_size = st.number_input(
+            '种群大小',
+            min_value=10, max_value=500, value=params['population_size'], step=10,
+            key='ga_pop_size',
+            help='每一代的个体数量，越大搜索能力越强但速度越慢'
+        )
+        max_generations = st.number_input(
+            '最大进化代数',
+            min_value=5, max_value=1000, value=params['max_generations'], step=10,
+            key='ga_max_gen',
+            help='进化的最大代数，建议50-200代'
+        )
+        crossover_prob = st.slider(
+            '交叉概率 (SBX)',
+            min_value=0.5, max_value=1.0, value=params['crossover_prob'], step=0.05,
+            key='ga_cx_prob',
+            help='两个父代个体进行交叉的概率，通常0.6-0.9'
+        )
+        mutation_prob = st.slider(
+            '变异概率 (PM)',
+            min_value=0.01, max_value=0.5, value=params['mutation_prob'], step=0.01,
+            key='ga_mut_prob',
+            help='每个基因发生变异的概率，通常0.05-0.2'
+        )
+        elitism_count = st.number_input(
+            '精英保留数',
+            min_value=0, max_value=10, value=params['elitism_count'], step=1,
+            key='ga_elitism',
+            help='每代直接保留的最优个体数，防止最优解退化'
+        )
+        tournament_size = st.number_input(
+            '锦标赛赛组大小',
+            min_value=2, max_value=10, value=params['tournament_size'], step=1,
+            key='ga_tour_size',
+            help='选择操作中每组竞争的个体数，通常2-5'
+        )
+
+    with param_col2:
+        st.markdown('##### 📐 算子与收敛参数')
+        sbx_eta = st.number_input(
+            'SBX分布指数 η',
+            min_value=1.0, max_value=100.0, value=params['sbx_eta'], step=1.0,
+            key='ga_sbx_eta',
+            help='模拟二进制交叉的分布指数，越大子代越接近父代'
+        )
+        pm_eta = st.number_input(
+            'PM分布指数 η',
+            min_value=1.0, max_value=100.0, value=params['pm_eta'], step=1.0,
+            key='ga_pm_eta',
+            help='多项式变异的分布指数，越大变异幅度越小'
+        )
+        convergence_generations = st.number_input(
+            '收敛判定代数',
+            min_value=5, max_value=100, value=params['convergence_generations'], step=5,
+            key='ga_conv_gen',
+            help='连续多少代改善小于阈值则提前终止'
+        )
+        convergence_improvement = st.number_input(
+            '收敛改善阈值 (%)',
+            min_value=0.001, max_value=5.0, value=params['convergence_improvement'] * 100, step=0.01,
+            key='ga_conv_imp',
+            format='%.3f',
+            help='连续代数内最优适应度改善小于此百分比则判定收敛'
+        ) / 100.0
+
+    with param_col3:
+        st.markdown('##### 🚧 约束与惩罚参数')
+        penalty_coefficient = st.number_input(
+            '约束惩罚系数',
+            min_value=1.0, max_value=100000.0, value=params['penalty_coefficient'], step=100.0,
+            key='ga_penalty',
+            help='违反约束时的惩罚放大系数，越大越倾向满足约束'
+        )
+        min_airflow_threshold = st.number_input(
+            '最低通风量阈值 (m³/s)',
+            min_value=0.5, max_value=50.0, value=params['min_airflow_threshold'], step=0.5,
+            key='ga_min_q',
+            help='每个工作面分支必须满足的最低风量要求'
+        )
+        st.markdown('##### 🔧 决策变量范围')
+        fan_speed_min = st.slider(
+            '扇风机转速系数下限',
+            min_value=0.1, max_value=1.0, value=params['fan_speed_min'], step=0.05,
+            key='ga_fan_min',
+            help='扇风机最低转速与额定转速的比值'
+        )
+        fan_speed_max = st.slider(
+            '扇风机转速系数上限',
+            min_value=1.0, max_value=2.0, value=params['fan_speed_max'], step=0.05,
+            key='ga_fan_max',
+            help='扇风机最高转速与额定转速的比值'
+        )
+        damper_max_mult = st.number_input(
+            '风门最大阻力倍数',
+            min_value=5.0, max_value=200.0, value=params['damper_max_mult'], step=5.0,
+            key='ga_damper_mult',
+            help='风门全关时，附加阻力为原阻力的多少倍'
+        )
+        tolerance = st.number_input(
+            '求解收敛阈值',
+            min_value=1e-7, max_value=0.1, value=params['tolerance'], step=1e-5,
+            key='ga_tol', format='%.7f',
+            help='Hardy-Cross求解器的收敛阈值'
+        )
+        max_iterations = st.number_input(
+            '求解最大迭代数',
+            min_value=50, max_value=5000, value=params['max_iterations'], step=50,
+            key='ga_max_iter'
+        )
+        random_seed = st.number_input(
+            '随机数种子',
+            min_value=0, max_value=999999, value=params['random_seed'], step=1,
+            key='ga_seed',
+            help='固定种子可复现优化结果'
+        )
+
+    st.divider()
+    st.subheader('🏭 工作面分支标记')
+    st.info('请从下方列表中选择需要检查最低通风量的工作面分支（显示格式：分支编号: 起节点→止节点）')
+
+    default_wf = st.session_state.ga_workface_ids if st.session_state.ga_workface_ids else []
+    valid_defaults = [wf for wf in default_wf if wf in non_atm_branch_ids]
+    workface_branch_ids = st.multiselect(
+        '选择工作面分支（可多选，至少选1个）',
+        options=non_atm_branch_ids,
+        default=valid_defaults if valid_defaults else non_atm_branch_ids[:3],
+        format_func=format_branch_label,
+        key='ga_workfaces',
+        help='选择后，系统会检查这些分支的风量是否满足最低通风量要求'
+    )
+    st.session_state.ga_workface_ids = workface_branch_ids
+
+    if workface_branch_ids:
+        st.write(f'✅ 已选择 {len(workface_branch_ids)} 个工作面分支:')
+        wf_df = pd.DataFrame([{
+            '分支编号': bid,
+            '起节点': network.get_branch(bid).from_node,
+            '止节点': network.get_branch(bid).to_node,
+            '长度 (m)': network.get_branch(bid).length,
+            '断面积 (m²)': network.get_branch(bid).area,
+            '扇风机': '是' if bid in fan_branch_ids else '否',
+            '调节风门': '是' if bid in damper_branch_ids else '否'
+        } for bid in workface_branch_ids])
+        st.dataframe(wf_df, use_container_width=True, hide_index=True)
+
+    col_info1, col_info2, col_info3 = st.columns(3)
+    with col_info1:
+        st.metric('扇风机决策变量', f'{len(fan_branch_ids)} 个',
+                  delta=f"转速范围: {fan_speed_min:.2f}~{fan_speed_max:.2f}x",
+                  delta_color='off')
+    with col_info2:
+        st.metric('风门决策变量', f'{len(damper_branch_ids)} 个',
+                  delta=f"开度范围: 0.0~1.0 (阻力{damper_max_mult:.0f}x)",
+                  delta_color='off')
+    with col_info3:
+        estimated_evals = population_size * max_generations
+        st.metric('预计评估次数', f'{estimated_evals:,} 次',
+                  delta=f'{population_size}×{max_generations}',
+                  delta_color='off')
+
+    st.divider()
+
+    new_params = {
+        'population_size': int(population_size),
+        'max_generations': int(max_generations),
+        'crossover_prob': float(crossover_prob),
+        'mutation_prob': float(mutation_prob),
+        'elitism_count': int(elitism_count),
+        'penalty_coefficient': float(penalty_coefficient),
+        'min_airflow_threshold': float(min_airflow_threshold),
+        'tournament_size': int(tournament_size),
+        'sbx_eta': float(sbx_eta),
+        'pm_eta': float(pm_eta),
+        'convergence_generations': int(convergence_generations),
+        'convergence_improvement': float(convergence_improvement),
+        'fan_speed_min': float(fan_speed_min),
+        'fan_speed_max': float(fan_speed_max),
+        'damper_max_mult': float(damper_max_mult),
+        'tolerance': float(tolerance),
+        'max_iterations': int(max_iterations),
+        'random_seed': int(random_seed) if random_seed > 0 else None,
+    }
+    st.session_state.ga_params = new_params
+
+    run_col1, run_col2 = st.columns([3, 1])
+    with run_col1:
+        run_optimization = st.button(
+            '🚀 开始遗传算法优化',
+            type='primary',
+            use_container_width=True,
+            disabled=len(workface_branch_ids) == 0,
+            help='搜索扇风机转速和风门开度的最优组合，最小化总能耗'
+        )
+    with run_col2:
+        if st.button('🔄 清除优化结果', use_container_width=True):
+            st.session_state.ga_result = None
+            st.rerun()
+
+    if len(workface_branch_ids) == 0:
+        st.warning('⚠️ 请至少选择一个工作面分支')
+
+    if run_optimization:
+        st.session_state.ga_result = None
+
+        ga_params_obj = GAParameters(
+            population_size=int(population_size),
+            max_generations=int(max_generations),
+            crossover_prob=float(crossover_prob),
+            mutation_prob=float(mutation_prob),
+            elitism_count=int(elitism_count),
+            tournament_size=int(tournament_size),
+            sbx_distribution_index=float(sbx_eta),
+            pm_distribution_index=float(pm_eta),
+            penalty_coefficient=float(penalty_coefficient),
+            min_airflow_threshold=float(min_airflow_threshold),
+            convergence_generations=int(convergence_generations),
+            convergence_improvement=float(convergence_improvement),
+            fan_speed_min=float(fan_speed_min),
+            fan_speed_max=float(fan_speed_max),
+            damper_max_resistance_multiplier=float(damper_max_mult),
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
+            random_seed=int(random_seed) if random_seed > 0 else None,
+        )
+
+        status_box = st.status('🔄 正在执行遗传算法优化...', expanded=True, state='running')
+        start_time = time.time()
+
+        try:
+            progress_bar = status_box.progress(0.0, text='初始化中...')
+            fitness_placeholder = status_box.empty()
+
+            def progress_cb(gen, total_gen, best_fit, avg_fit, worst_fit):
+                frac = gen / total_gen
+                progress_bar.progress(
+                    frac,
+                    text=f'代数: {gen}/{total_gen} | 最优适应度: {best_fit:.1f} W | 平均: {avg_fit:.1f} W'
+                )
+                fitness_placeholder.info(
+                    f'📊 当前进度 {gen}/{total_gen} ({frac*100:.1f}%) | '
+                    f'**最优**: {best_fit:.2f} W | **平均**: {avg_fit:.2f} W | **最差**: {worst_fit:.2f} W'
+                )
+
+            result = run_genetic_optimization(
+                network=network,
+                workface_branch_ids=workface_branch_ids,
+                params=ga_params_obj,
+                progress_callback=progress_cb,
+            )
+            st.session_state.ga_result = result
+
+            total_time = time.time() - start_time
+            if result.success:
+                status_box.update(
+                    state='complete',
+                    label=f'✅ 优化完成! 总耗时: {total_time:.2f} 秒 | 节能: {result.energy_saving_percent:.1f}%'
+                )
+            else:
+                status_box.update(state='error', label=f'❌ 优化失败: {result.message}')
+
+        except Exception as e:
+            status_box.update(state='error', label=f'❌ 优化异常: {str(e)}')
+            import traceback
+            status_box.code(traceback.format_exc())
+
+    if st.session_state.ga_result is not None:
+        result: GAOptimizationResult = st.session_state.ga_result
+
+        if not result.success:
+            st.error(f'优化失败: {result.message}')
+            return
+
+        st.divider()
+        st.subheader('📊 优化结果概览')
+
+        all_constraints_ok = all(result.constraint_satisfied.values())
+        n_satisfied = sum(1 for v in result.constraint_satisfied.values() if v)
+        n_total = len(result.constraint_satisfied)
+
+        res_col1, res_col2, res_col3, res_col4 = st.columns(4)
+        with res_col1:
+            saving_delta = f'{result.energy_saving_percent:.1f}% 节能' if result.energy_saving_percent > 0 else '无节能'
+            saving_color = 'normal' if result.energy_saving_percent > 0 else 'off'
+            st.metric(
+                '系统总轴功率',
+                f'{result.best_power:.2f} W',
+                delta=saving_delta,
+                delta_color=saving_color
+            )
+        with res_col2:
+            st.metric(
+                '初始方案功率',
+                f'{result.initial_power:.2f} W',
+                delta=f'vs 初始 {result.initial_power - result.best_power:+.2f} W',
+                delta_color='inverse'
+            )
+        with res_col3:
+            constraint_status = '✅ 全部满足' if all_constraints_ok else f'⚠️ {n_satisfied}/{n_total}'
+            constraint_color = 'normal' if all_constraints_ok else 'inverse'
+            st.metric(
+                '约束满足情况',
+                constraint_status,
+                delta=f'{n_satisfied}/{n_total} 工作面达标',
+                delta_color=constraint_color
+            )
+        with res_col4:
+            conv_status = '✅ 已收敛' if result.converged else '⏹️ 达到最大代数'
+            st.metric(
+                '进化收敛状态',
+                conv_status,
+                delta=f'{result.generations_run} 代 / {result.parameters.max_generations}',
+                delta_color='off'
+            )
+
+        res_col5, res_col6, res_col7, res_col8 = st.columns(4)
+        with res_col5:
+            st.metric('总耗时', f'{result.total_time:.2f} 秒')
+        with res_col6:
+            total_evals = result.generations_run * result.parameters.population_size
+            avg_eval_time = result.total_time / total_evals * 1000 if total_evals > 0 else 0
+            st.metric('总评估次数', f'{total_evals:,} 次',
+                      delta=f'{avg_eval_time:.1f} ms/次', delta_color='off')
+        with res_col7:
+            st.metric('最优适应度', f'{result.best_fitness:.1f} W',
+                      delta=f'含惩罚 {result.best_fitness - result.best_power:.1f}',
+                      delta_color='off')
+        with res_col8:
+            total_violation_w = result.parameters.penalty_coefficient * result.total_violation
+            st.metric('约束惩罚值', f'{total_violation_w:.1f} W',
+                      delta=f'违反量 {result.total_violation:.4f}',
+                      delta_color='inverse' if result.total_violation > 0 else 'off')
+
+        result_tabs = st.tabs([
+            '⚙️ 最优决策方案',
+            '📈 收敛曲线图',
+            '🎯 决策变量雷达图',
+            '🌬️ 工作面风量对比',
+            '⚡ 能耗对比图',
+            '📋 全网风量分配',
+            '📥 结果导出'
+        ])
+
+        with result_tabs[0]:
+            st.subheader('🎯 最优扇风机转速与调节风门开度方案')
+
+            dv_fig = plot_ga_decision_variables_bar(result)
+            st.pyplot(dv_fig, use_container_width=True)
+
+            dv_col1, dv_col2 = st.columns(2)
+            with dv_col1:
+                if fan_branch_ids:
+                    st.markdown('##### 🔧 扇风机转速方案')
+                    fan_data = []
+                    for fid in sorted(result.fan_speeds.keys()):
+                        speed = result.fan_speeds[fid]
+                        change_pct = (speed - 1.0) * 100
+                        fan_data.append({
+                            '分支编号': fid,
+                            '转速系数': f'{speed:.4f}',
+                            '相对额定转速': f'{change_pct:+.2f}%',
+                            '转速状态': '升速 ⬆️' if speed > 1.01 else ('降速 ⬇️' if speed < 0.99 else '额定 ➡️'),
+                        })
+                    st.dataframe(pd.DataFrame(fan_data), use_container_width=True, hide_index=True)
+                else:
+                    st.info('网络中无扇风机')
+
+            with dv_col2:
+                if damper_branch_ids:
+                    st.markdown('##### 🚧 调节风门开度方案')
+                    damper_data = []
+                    for did in sorted(result.damper_openings.keys()):
+                        opening = result.damper_openings[did]
+                        opening_pct = opening * 100
+                        branch = network.get_branch(did)
+                        base_r = 0
+                        if branch:
+                            from core.resistance import calculate_friction_resistance, calculate_local_resistance
+                            base_r = (calculate_friction_resistance(
+                                branch.friction_coeff, branch.length, branch.perimeter, branch.area
+                            ) + calculate_local_resistance(branch.local_coeff, branch.area))
+                        added_r = base_r * result.parameters.damper_max_resistance_multiplier * (1.0 - opening)
+                        damper_data.append({
+                            '分支编号': did,
+                            '开度系数': f'{opening:.4f}',
+                            '开度百分比': f'{opening_pct:.2f}%',
+                            '附加阻力 (Ns²/m⁸)': f'{added_r:.6f}',
+                            '开度状态': '全开' if opening >= 0.99 else ('全关' if opening <= 0.01 else '调节'),
+                        })
+                    st.dataframe(pd.DataFrame(damper_data), use_container_width=True, hide_index=True)
+                else:
+                    st.info('网络中无调节风门')
+
+        with result_tabs[1]:
+            st.subheader('📈 遗传算法收敛曲线')
+            if result.history:
+                conv_fig = plot_ga_convergence_curve(result.history)
+                st.pyplot(conv_fig, use_container_width=True)
+
+                with st.expander('📋 各代适应度详情', expanded=False):
+                    hist_data = []
+                    for h in result.history:
+                        hist_data.append({
+                            '代数': h.generation,
+                            '最优适应度 (W)': f'{h.best_fitness:.2f}',
+                            '平均适应度 (W)': f'{h.avg_fitness:.2f}',
+                            '最差适应度 (W)': f'{h.worst_fitness:.2f}',
+                        })
+                    st.dataframe(pd.DataFrame(hist_data), use_container_width=True, hide_index=True)
+            else:
+                st.info('无进化历史数据')
+
+        with result_tabs[2]:
+            st.subheader('🎯 决策变量雷达图（归一化显示）')
+            radar_fig = plot_ga_radar_chart(result)
+            st.pyplot(radar_fig, use_container_width=True)
+            st.caption('雷达图将所有决策变量归一化到0-1范围。红线表示基准方案（风机额定转速1.0x，风门全开1.0）。'
+                      '蓝色区域越靠近外圈表示值越大（风机转速越高，风门开度越大）。')
+
+        with result_tabs[3]:
+            st.subheader('🌬️ 优化前后工作面风量对比')
+            wf_fig = plot_ga_airflow_comparison(result, network, workface_branch_ids)
+            st.pyplot(wf_fig, use_container_width=True)
+
+            with st.expander('📋 工作面风量详细检查', expanded=True):
+                wf_detail_data = []
+                for wf_id in sorted(workface_branch_ids):
+                    branch = network.get_branch(wf_id)
+                    initial_q = abs(branch.airflow) if branch else 0.0
+                    opt_q = result.workface_airflows.get(wf_id, 0.0)
+                    threshold = result.parameters.min_airflow_threshold
+                    satisfied = result.constraint_satisfied.get(wf_id, False)
+                    deficit = max(0.0, threshold - opt_q)
+                    change_pct = ((opt_q - initial_q) / initial_q * 100) if initial_q > 0 else 0
+                    wf_detail_data.append({
+                        '分支编号': wf_id,
+                        '起→止节点': f'{branch.from_node}→{branch.to_node}' if branch else 'N/A',
+                        '优化前风量 (m³/s)': f'{initial_q:.3f}',
+                        '优化后风量 (m³/s)': f'{opt_q:.3f}',
+                        '变化百分比': f'{change_pct:+.2f}%',
+                        '最低阈值 (m³/s)': f'{threshold:.2f}',
+                        '不足量 (m³/s)': f'{deficit:.3f}' if deficit > 0 else '0.000',
+                        '是否满足约束': '✅ 满足' if satisfied else '❌ 不满足',
+                    })
+                st.dataframe(pd.DataFrame(wf_detail_data), use_container_width=True, hide_index=True)
+
+        with result_tabs[4]:
+            st.subheader('⚡ 优化前后系统能耗对比')
+            power_fig = plot_ga_power_comparison(result)
+            st.pyplot(power_fig, use_container_width=True)
+
+            with st.expander('💰 能耗节省估算（按年运行8000小时）', expanded=False):
+                saving_w = max(0.0, result.initial_power - result.best_power)
+                saving_kwh_per_year = saving_w * 8000 / 1000
+                saving_per_year_rmb = saving_kwh_per_year * 0.6
+                st.markdown(f"""
+                | 指标 | 数值 |
+                |------|------|
+                | **初始功率** | {result.initial_power:.2f} W = {result.initial_power/1000:.3f} kW |
+                | **优化后功率** | {result.best_power:.2f} W = {result.best_power/1000:.3f} kW |
+                | **节能功率** | {saving_w:.2f} W = {saving_w/1000:.3f} kW |
+                | **节能率** | {result.energy_saving_percent:.2f}% |
+                | **年节电量（8000h）** | {saving_kwh_per_year:.2f} kWh |
+                | **年节省电费（0.6元/kWh）** | ¥ {saving_per_year_rmb:,.2f} |
+                """)
+
+        with result_tabs[5]:
+            st.subheader('📋 最优方案全网风量分配')
+
+            optimized_network = copy.deepcopy(network)
+            optimized_network.update_solution(result.all_airflows, result.all_pressures)
+            from core.resistance import calculate_all_branch_resistances, calculate_network_natural_pressures, update_branch_pressure_drops
+            calculate_all_branch_resistances(optimized_network)
+            nat_p = calculate_network_natural_pressures(optimized_network)
+            update_branch_pressure_drops(optimized_network, nat_p)
+
+            all_data = []
+            for bid in sorted(optimized_network.branches.keys()):
+                br = optimized_network.get_branch(bid)
+                init_br = network.get_branch(bid)
+                initial_q = abs(init_br.airflow) if init_br else 0.0
+                opt_q = abs(br.airflow)
+                change_pct = ((opt_q - initial_q) / initial_q * 100) if initial_q > 0 else 0
+                is_workface = '✅ 工作面' if bid in workface_branch_ids else ''
+                meets_constraint = ''
+                if bid in workface_branch_ids:
+                    meets_constraint = '✅ 满足' if result.constraint_satisfied.get(bid, False) else '❌ 不满足'
+                all_data.append({
+                    '分支编号': bid,
+                    '起→止': f'{br.from_node}→{br.to_node}',
+                    '优化前 (m³/s)': f'{initial_q:.3f}',
+                    '优化后 (m³/s)': f'{opt_q:.3f}',
+                    '变化': f'{change_pct:+.2f}%',
+                    '阻力 (Ns²/m⁸)': f'{br.resistance:.6f}',
+                    '风压降 (Pa)': f'{br.pressure_drop:.2f}',
+                    '工作面标记': is_workface,
+                    '约束状态': meets_constraint,
+                })
+            st.dataframe(pd.DataFrame(all_data), use_container_width=True, hide_index=True)
+
+            col_pv1, col_pv2, col_pv3 = st.columns(3)
+            with col_pv1:
+                show_q_pv = st.checkbox('显示风量', value=True, key='ga_pv_q')
+            with col_pv2:
+                show_p_pv = st.checkbox('显示风压', value=True, key='ga_pv_p')
+            with col_pv3:
+                show_fan_pv = st.checkbox('显示扇风机', value=True, key='ga_pv_fan')
+
+            with st.spinner('渲染最优方案拓扑图...'):
+                from visualization.network_plot import plot_network
+                topo_fig = plot_network(
+                    optimized_network,
+                    show_airflow=show_q_pv,
+                    show_pressure=show_p_pv,
+                    show_fan_icon=show_fan_pv,
+                    figsize=(14, 10)
+                )
+                st.pyplot(topo_fig, use_container_width=True)
+
+        with result_tabs[6]:
+            st.subheader('📥 导出优化结果')
+
+            json_str = export_ga_result_to_json(result)
+
+            exp_col1, exp_col2 = st.columns([3, 1])
+            with exp_col1:
+                st.download_button(
+                    label='⬇️ 下载JSON格式优化结果',
+                    data=json_str,
+                    file_name=f'ga_optimization_result_{int(time.time())}.json',
+                    mime='application/json',
+                    use_container_width=True,
+                    type='primary'
+                )
+
+            with st.expander('📄 预览JSON结果内容', expanded=False):
+                st.code(json_str, language='json')
+
+            with st.expander('📋 优化参数配置摘要', expanded=True):
+                summary_text = f"""
+**遗传算法参数配置:**
+- 种群大小: {result.parameters.population_size}
+- 最大代数: {result.parameters.max_generations}
+- 交叉概率 (SBX): {result.parameters.crossover_prob:.2f}, 分布指数: {result.parameters.sbx_distribution_index}
+- 变异概率 (PM): {result.parameters.mutation_prob:.3f}, 分布指数: {result.parameters.pm_distribution_index}
+- 精英保留: {result.parameters.elitism_count} 个, 锦标赛大小: {result.parameters.tournament_size}
+- 惩罚系数: {result.parameters.penalty_coefficient:.1f}
+- 最低通风量阈值: {result.parameters.min_airflow_threshold:.2f} m³/s
+
+**决策变量范围:**
+- 扇风机转速系数: {result.parameters.fan_speed_min:.2f} ~ {result.parameters.fan_speed_max:.2f} (额定1.0x)
+- 风门开度: {result.parameters.damper_open_min:.2f} ~ {result.parameters.damper_open_max:.2f}
+- 风门全关时最大阻力倍数: {result.parameters.damper_max_resistance_multiplier:.0f}x
+
+**运行参数:**
+- 收敛判定: 连续 {result.parameters.convergence_generations} 代改善 < {result.parameters.convergence_improvement*100:.2f}%
+- Hardy-Cross求解: 容差 {result.parameters.tolerance:.2e}, 最大迭代 {result.parameters.max_iterations}
+
+**实际运行结果:**
+- 实际运行代数: {result.generations_run}
+- 总评估次数: {result.generations_run * result.parameters.population_size:,}
+- 总耗时: {result.total_time:.2f} 秒
+- 是否提前收敛: {'是' if result.converged else '否'}
+- 最终最优适应度: {result.best_fitness:.2f} W
+"""
+                st.text(summary_text)
+
+
 def _build_default_presets(network: VentilationNetwork) -> List[Dict]:
     branch_ids = sorted(network.branches.keys())
     fan_ids = [b.id for b in network.get_fan_branches()]
@@ -2347,13 +3003,14 @@ def main():
     st.title('⛏️ 矿井通风网络阻力计算与风流分配模拟系统')
     st.markdown('---')
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         '📐 网络定义',
         '🔬 求解计算',
         '📊 可视化分析',
         '⏱️ 时间序列',
-        '� 可靠性分析',
-        '�📑 报告导出'
+        '🔒 可靠性分析',
+        '🧬 遗传优化',
+        '📑 报告导出'
     ])
 
     with tab1:
@@ -2372,10 +3029,13 @@ def main():
         reliability_analysis_tab()
 
     with tab6:
+        genetic_optimization_tab()
+
+    with tab7:
         report_tab()
 
     st.markdown('---')
-    st.caption('矿井通风网络模拟系统 v3.0 | 含时间序列模拟与可靠性分析模块')
+    st.caption('矿井通风网络模拟系统 v4.0 | 含时间序列模拟、可靠性分析与遗传算法优化模块')
 
 
 if __name__ == '__main__':
