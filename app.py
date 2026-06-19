@@ -79,6 +79,7 @@ from core.genetic_optimization import (
     GAParameters,
     GAOptimizationResult,
     export_ga_result_to_json,
+    import_ga_result_from_json,
 )
 from visualization.ga_plot import (
     plot_ga_convergence_curve,
@@ -86,6 +87,8 @@ from visualization.ga_plot import (
     plot_ga_airflow_comparison,
     plot_ga_decision_variables_bar,
     plot_ga_power_comparison,
+    plot_sensitivity_heatmap,
+    plot_scheme_comparison_bar,
 )
 
 st.set_page_config(
@@ -141,6 +144,10 @@ if 'ga_params' not in st.session_state:
     st.session_state.ga_params = None
 if 'ga_workface_ids' not in st.session_state:
     st.session_state.ga_workface_ids = None
+if 'ga_history_schemes' not in st.session_state:
+    st.session_state.ga_history_schemes = []
+if 'ga_sensitivity_result' not in st.session_state:
+    st.session_state.ga_sensitivity_result = None
 
 
 def load_sample_network():
@@ -1883,12 +1890,47 @@ def genetic_optimization_tab():
             'tolerance': 0.001,
             'max_iterations': 500,
             'random_seed': 42,
+            'optimization_mode': 'single',
+            'energy_weight': 0.5,
+            'uniformity_weight': 0.5,
         }
         st.session_state.ga_workface_ids = []
 
     params = st.session_state.ga_params
 
     st.subheader('⚙️ 遗传算法参数设置')
+
+    mode_col1, mode_col2, mode_col3 = st.columns([2, 2, 2])
+    with mode_col1:
+        optimization_mode = st.selectbox(
+            '优化模式',
+            ['single', 'dual'],
+            index=0 if params.get('optimization_mode', 'single') == 'single' else 1,
+            format_func=lambda x: '单目标优化 (仅能耗)' if x == 'single' else '双目标优化 (能耗+均匀度)',
+            key='ga_opt_mode',
+            help='单目标: 仅最小化总能耗; 双目标: 用加权求和法同时优化能耗和均匀度'
+        )
+    with mode_col2:
+        energy_weight = st.slider(
+            '能耗权重',
+            min_value=0.0, max_value=1.0,
+            value=params.get('energy_weight', 0.5),
+            step=0.05,
+            key='ga_energy_weight',
+            disabled=optimization_mode == 'single',
+            help='双目标模式下能耗目标的权重'
+        )
+    with mode_col3:
+        uniformity_weight = 1.0 - energy_weight if optimization_mode == 'dual' else 0.0
+        st.metric(
+            '均匀度权重',
+            f'{uniformity_weight:.2f}',
+            delta='能耗+均匀度=1.0' if optimization_mode == 'dual' else '单目标模式'
+        )
+
+    if optimization_mode == 'single':
+        energy_weight = 1.0
+        uniformity_weight = 0.0
 
     param_col1, param_col2, param_col3 = st.columns(3)
 
@@ -2079,6 +2121,9 @@ def genetic_optimization_tab():
         'tolerance': float(tolerance),
         'max_iterations': int(max_iterations),
         'random_seed': int(random_seed) if random_seed > 0 else None,
+        'optimization_mode': optimization_mode,
+        'energy_weight': float(energy_weight),
+        'uniformity_weight': float(uniformity_weight),
     }
     st.session_state.ga_params = new_params
 
@@ -2121,6 +2166,9 @@ def genetic_optimization_tab():
             tolerance=float(tolerance),
             max_iterations=int(max_iterations),
             random_seed=int(random_seed) if random_seed > 0 else None,
+            optimization_mode=optimization_mode,
+            energy_weight=float(energy_weight),
+            uniformity_weight=float(uniformity_weight),
         )
 
         status_box = st.status('🔄 正在执行遗传算法优化...', expanded=True, state='running')
@@ -2148,6 +2196,33 @@ def genetic_optimization_tab():
                 progress_callback=progress_cb,
             )
             st.session_state.ga_result = result
+
+            if result.success:
+                scheme_label = (
+                    f"{optimization_mode}目标 "
+                    f"pop={population_size} gen={max_generations} "
+                    f"cx={crossover_prob:.2f} mut={mutation_prob:.2f}"
+                )
+                scheme_data = {
+                    'label': scheme_label,
+                    'best_power': result.best_power,
+                    'initial_power': result.initial_power,
+                    'energy_saving_percent': result.energy_saving_percent,
+                    'workface_airflows': dict(result.workface_airflows),
+                    'constraint_satisfied': {int(k): bool(v) for k, v in result.constraint_satisfied.items()},
+                    'generations_run': result.generations_run,
+                    'converged': result.converged,
+                    'uniformity_value': result.uniformity_value,
+                    'pareto_efficiency': result.pareto_efficiency,
+                    'optimization_mode': optimization_mode,
+                    'min_airflow_threshold': min_airflow_threshold,
+                    'total_time': result.total_time,
+                }
+                history_schemes = st.session_state.ga_history_schemes.copy()
+                history_schemes.append(scheme_data)
+                if len(history_schemes) > 5:
+                    history_schemes = history_schemes[-5:]
+                st.session_state.ga_history_schemes = history_schemes
 
             total_time = time.time() - start_time
             status_box.empty()
@@ -2238,6 +2313,26 @@ def genetic_optimization_tab():
                       delta=f'违反量 {result.total_violation:.4f}',
                       delta_color='inverse' if result.total_violation > 0 else 'off')
 
+        if result.parameters.optimization_mode == 'dual':
+            st.divider()
+            st.subheader('🎯 双目标优化指标')
+            obj_col1, obj_col2, obj_col3 = st.columns(3)
+            with obj_col1:
+                st.metric('能耗目标值', f'{result.best_power:.2f} W',
+                          delta=f'初始 {result.initial_power:.2f} W',
+                          delta_color='inverse')
+            with obj_col2:
+                uniformity_improve = 0.0
+                if result.initial_uniformity > 0:
+                    uniformity_improve = (result.initial_uniformity - result.uniformity_value) / result.initial_uniformity * 100
+                st.metric('均匀度目标值 (标准差)', f'{result.uniformity_value:.4f}',
+                          delta=f'初始 {result.initial_uniformity:.4f} ({uniformity_improve:+.1f}%)',
+                          delta_color='normal' if uniformity_improve > 0 else 'inverse')
+            with obj_col3:
+                st.metric('帕累托效率指标', f'{result.pareto_efficiency:.4f}',
+                          delta=f'w_energy={result.parameters.energy_weight:.2f}, w_uniform={result.parameters.uniformity_weight:.2f}',
+                          delta_color='off')
+
         result_tabs = st.tabs([
             '⚙️ 最优决策方案',
             '📈 收敛曲线图',
@@ -2245,7 +2340,9 @@ def genetic_optimization_tab():
             '🌬️ 工作面风量对比',
             '⚡ 能耗对比图',
             '📋 全网风量分配',
-            '📥 结果导出'
+            '📊 方案对比',
+            '🔬 敏感性分析',
+            '📥 结果导出与持久化'
         ])
 
         with result_tabs[0]:
@@ -2301,7 +2398,12 @@ def genetic_optimization_tab():
         with result_tabs[1]:
             st.subheader('📈 遗传算法收敛曲线')
             if result.history:
-                conv_fig = plot_ga_convergence_curve(result.history)
+                conv_fig = plot_ga_convergence_curve(
+                    result.history,
+                    converged=result.converged,
+                    convergence_reason=result.convergence_reason,
+                    generations_run=result.generations_run,
+                )
                 st.pyplot(conv_fig, use_container_width=True)
 
                 with st.expander('📋 各代适应度详情', expanded=False):
@@ -2425,12 +2527,161 @@ def genetic_optimization_tab():
                 st.pyplot(topo_fig, use_container_width=True)
 
         with result_tabs[6]:
-            st.subheader('📥 导出优化结果')
+            st.subheader('📊 优化方案对比')
+
+            history_schemes = st.session_state.ga_history_schemes
+
+            if not history_schemes:
+                st.info('暂无历史方案。运行多次优化(不同参数组合)后可在此对比。')
+            else:
+                st.write(f'历史方案数: {len(history_schemes)}/5')
+
+                selected_indices = []
+                compare_cols = st.columns(min(len(history_schemes), 5))
+                for i, scheme in enumerate(history_schemes):
+                    with compare_cols[i % len(compare_cols)]:
+                        if st.checkbox(
+                            f'方案{i+1}',
+                            value=True,
+                            key=f'ga_cmp_{i}',
+                        ):
+                            selected_indices.append(i)
+                        st.caption(scheme.get('label', f'方案{i+1}'))
+
+                if not selected_indices:
+                    st.warning('请至少选择一个方案进行对比')
+                else:
+                    selected_schemes = [history_schemes[i] for i in selected_indices]
+
+                    compare_data = []
+                    for i, scheme in enumerate(selected_schemes):
+                        row = {
+                            '方案': scheme.get('label', f'方案{i+1}'),
+                            '总功率(W)': f'{scheme["best_power"]:.2f}',
+                            '节能率(%)': f'{scheme["energy_saving_percent"]:.1f}',
+                            '运行代数': scheme['generations_run'],
+                            '是否收敛': '是' if scheme['converged'] else '否',
+                            '均匀度': f'{scheme.get("uniformity_value", 0):.4f}',
+                            '帕累托效率': f'{scheme.get("pareto_efficiency", 0):.4f}',
+                        }
+                        for wf_id in sorted(workface_branch_ids):
+                            wf_q = scheme.get('workface_airflows', {}).get(wf_id, 0.0)
+                            row[f'工作面{wf_id}风量'] = f'{wf_q:.3f}'
+                            satisfied = scheme.get('constraint_satisfied', {}).get(wf_id, False)
+                            row[f'工作面{wf_id}约束'] = '✅' if satisfied else '❌'
+                        compare_data.append(row)
+                    st.dataframe(pd.DataFrame(compare_data), use_container_width=True, hide_index=True)
+
+                    fig_cmp = plot_scheme_comparison_bar(
+                        selected_schemes, workface_branch_ids
+                    )
+                    st.pyplot(fig_cmp, use_container_width=True)
+
+        with result_tabs[7]:
+            st.subheader('🔬 参数敏感性分析')
+
+            if st.button('🧪 运行敏感性分析', type='primary', use_container_width=True, key='ga_sensitivity_btn'):
+                st.session_state.ga_sensitivity_result = None
+
+                base_params = GAParameters(
+                    population_size=int(population_size),
+                    max_generations=max(1, int(max_generations) // 2),
+                    crossover_prob=float(crossover_prob),
+                    mutation_prob=float(mutation_prob),
+                    elitism_count=int(elitism_count),
+                    tournament_size=int(tournament_size),
+                    sbx_distribution_index=float(sbx_eta),
+                    pm_distribution_index=float(pm_eta),
+                    penalty_coefficient=float(penalty_coefficient),
+                    min_airflow_threshold=float(min_airflow_threshold),
+                    convergence_generations=int(convergence_generations),
+                    convergence_improvement=float(convergence_improvement),
+                    fan_speed_min=float(fan_speed_min),
+                    fan_speed_max=float(fan_speed_max),
+                    damper_max_resistance_multiplier=float(damper_max_mult),
+                    tolerance=float(tolerance),
+                    max_iterations=int(max_iterations),
+                    random_seed=int(random_seed) if random_seed > 0 else None,
+                    optimization_mode=optimization_mode,
+                    energy_weight=float(energy_weight),
+                    uniformity_weight=float(uniformity_weight),
+                )
+
+                param_variations = {
+                    'population_size': [0.5, 1.0, 2.0],
+                    'crossover_prob': [0.5, 1.0, 2.0],
+                    'mutation_prob': [0.5, 1.0, 2.0],
+                }
+
+                sensitivity_data = {}
+                total_combos = sum(len(v) for v in param_variations.values())
+                progress = st.progress(0.0, text='准备敏感性分析...')
+                combo_idx = 0
+
+                for param_name, levels in param_variations.items():
+                    sensitivity_data[param_name] = {}
+                    for level in levels:
+                        combo_idx += 1
+                        progress.progress(
+                            combo_idx / total_combos,
+                            text=f'分析参数: {param_name} × {level:.1f} ({combo_idx}/{total_combos})...'
+                        )
+                        varied_params = copy.deepcopy(base_params)
+                        if param_name == 'population_size':
+                            varied_params.population_size = max(5, int(population_size * level))
+                        elif param_name == 'crossover_prob':
+                            varied_params.crossover_prob = min(1.0, max(0.1, crossover_prob * level))
+                        elif param_name == 'mutation_prob':
+                            varied_params.mutation_prob = min(0.5, max(0.01, mutation_prob * level))
+
+                        try:
+                            sens_result = run_genetic_optimization(
+                                network=network,
+                                workface_branch_ids=workface_branch_ids,
+                                params=varied_params,
+                            )
+                            if sens_result.success:
+                                sensitivity_data[param_name][level] = (
+                                    sens_result.best_fitness,
+                                    sens_result.generations_run,
+                                )
+                            else:
+                                sensitivity_data[param_name][level] = (float('inf'), 0)
+                        except Exception:
+                            sensitivity_data[param_name][level] = (float('inf'), 0)
+
+                st.session_state.ga_sensitivity_result = sensitivity_data
+                progress.progress(1.0, text='✅ 敏感性分析完成!')
+
+            if st.session_state.ga_sensitivity_result is not None:
+                sensitivity_data = st.session_state.ga_sensitivity_result
+                fig_heatmap = plot_sensitivity_heatmap(sensitivity_data)
+                st.pyplot(fig_heatmap, use_container_width=True)
+
+                with st.expander('📋 敏感性分析详细数据', expanded=True):
+                    sens_detail = []
+                    param_labels_cn = {
+                        'population_size': '种群大小',
+                        'crossover_prob': '交叉概率',
+                        'mutation_prob': '变异概率',
+                    }
+                    for pname, levels in sensitivity_data.items():
+                        for level, (fitness, gen_run) in sorted(levels.items()):
+                            sens_detail.append({
+                                '参数': param_labels_cn.get(pname, pname),
+                                '水平(倍数)': f'{level:.1f}x',
+                                '最终适应度(W)': f'{fitness:.2f}' if fitness != float('inf') else '失败',
+                                '收敛代数': gen_run,
+                            })
+                    st.dataframe(pd.DataFrame(sens_detail), use_container_width=True, hide_index=True)
+
+        with result_tabs[8]:
+            st.subheader('📥 结果导出与持久化')
 
             json_str = export_ga_result_to_json(result)
 
-            exp_col1, exp_col2 = st.columns([3, 1])
-            with exp_col1:
+            export_col1, export_col2, export_col3 = st.columns(3)
+            with export_col1:
                 st.download_button(
                     label='⬇️ 下载JSON格式优化结果',
                     data=json_str,
@@ -2440,12 +2691,81 @@ def genetic_optimization_tab():
                     type='primary'
                 )
 
+            with export_col2:
+                network_json = network.to_json()
+                full_save_data = {
+                    'ga_result': json.loads(json_str),
+                    'network': json.loads(network_json),
+                }
+                full_save_str = json.dumps(full_save_data, indent=2, ensure_ascii=False)
+                timestamp_str = time.strftime('%Y%m%d_%H%M%S')
+                st.download_button(
+                    label='💾 保存到本地 (含网络参数)',
+                    data=full_save_str,
+                    file_name=f'ga_result_{timestamp_str}.json',
+                    mime='application/json',
+                    use_container_width=True,
+                )
+
+            with export_col3:
+                loaded_file = st.file_uploader(
+                    '📂 加载历史结果',
+                    type=['json'],
+                    key='ga_load_history',
+                )
+                if loaded_file is not None:
+                    try:
+                        loaded_data = json.loads(loaded_file.read().decode('utf-8'))
+                        if 'ga_result' in loaded_data and 'network' in loaded_data:
+                            loaded_result = import_ga_result_from_json(
+                                json.dumps(loaded_data['ga_result'], ensure_ascii=False)
+                            )
+                            loaded_network = VentilationNetwork.from_dict(loaded_data['network'])
+                            st.session_state.ga_result = loaded_result
+                            st.session_state.network = loaded_network
+                            st.session_state.ga_params = {
+                                'population_size': loaded_result.parameters.population_size,
+                                'max_generations': loaded_result.parameters.max_generations,
+                                'crossover_prob': loaded_result.parameters.crossover_prob,
+                                'mutation_prob': loaded_result.parameters.mutation_prob,
+                                'elitism_count': loaded_result.parameters.elitism_count,
+                                'penalty_coefficient': loaded_result.parameters.penalty_coefficient,
+                                'min_airflow_threshold': loaded_result.parameters.min_airflow_threshold,
+                                'tournament_size': loaded_result.parameters.tournament_size,
+                                'sbx_eta': loaded_result.parameters.sbx_distribution_index,
+                                'pm_eta': loaded_result.parameters.pm_distribution_index,
+                                'convergence_generations': loaded_result.parameters.convergence_generations,
+                                'convergence_improvement': loaded_result.parameters.convergence_improvement,
+                                'fan_speed_min': loaded_result.parameters.fan_speed_min,
+                                'fan_speed_max': loaded_result.parameters.fan_speed_max,
+                                'damper_max_mult': loaded_result.parameters.damper_max_resistance_multiplier,
+                                'tolerance': loaded_result.parameters.tolerance,
+                                'max_iterations': loaded_result.parameters.max_iterations,
+                                'random_seed': loaded_result.parameters.random_seed or 0,
+                                'optimization_mode': loaded_result.parameters.optimization_mode,
+                                'energy_weight': loaded_result.parameters.energy_weight,
+                                'uniformity_weight': loaded_result.parameters.uniformity_weight,
+                            }
+                            st.success('✅ 历史结果加载成功！页面将刷新。')
+                            st.rerun()
+                        else:
+                            loaded_result = import_ga_result_from_json(
+                                json.dumps(loaded_data, ensure_ascii=False)
+                            )
+                            st.session_state.ga_result = loaded_result
+                            st.success('✅ 优化结果加载成功！')
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f'加载失败: {str(e)}')
+
             with st.expander('📄 预览JSON结果内容', expanded=False):
                 st.code(json_str, language='json')
 
             with st.expander('📋 优化参数配置摘要', expanded=True):
+                mode_str = '单目标(仅能耗)' if result.parameters.optimization_mode == 'single' else '双目标(能耗+均匀度)'
                 summary_text = f"""
 **遗传算法参数配置:**
+- 优化模式: {mode_str}
 - 种群大小: {result.parameters.population_size}
 - 最大代数: {result.parameters.max_generations}
 - 交叉概率 (SBX): {result.parameters.crossover_prob:.2f}, 分布指数: {result.parameters.sbx_distribution_index}
@@ -2453,7 +2773,14 @@ def genetic_optimization_tab():
 - 精英保留: {result.parameters.elitism_count} 个, 锦标赛大小: {result.parameters.tournament_size}
 - 惩罚系数: {result.parameters.penalty_coefficient:.1f}
 - 最低通风量阈值: {result.parameters.min_airflow_threshold:.2f} m³/s
-
+"""
+                if result.parameters.optimization_mode == 'dual':
+                    summary_text += f"""
+**双目标权重:**
+- 能耗权重: {result.parameters.energy_weight:.2f}
+- 均匀度权重: {result.parameters.uniformity_weight:.2f}
+"""
+                summary_text += f"""
 **决策变量范围:**
 - 扇风机转速系数: {result.parameters.fan_speed_min:.2f} ~ {result.parameters.fan_speed_max:.2f} (额定1.0x)
 - 风门开度: {result.parameters.damper_open_min:.2f} ~ {result.parameters.damper_open_max:.2f}
@@ -2469,6 +2796,7 @@ def genetic_optimization_tab():
 - 总耗时: {result.total_time:.2f} 秒
 - 是否提前收敛: {'是' if result.converged else '否'}
 - 最终最优适应度: {result.best_fitness:.2f} W
+- 收敛原因: {result.convergence_reason or 'N/A'}
 """
                 st.text(summary_text)
 
@@ -3049,7 +3377,7 @@ def main():
         report_tab()
 
     st.markdown('---')
-    st.caption('矿井通风网络模拟系统 v4.0 | 含时间序列模拟、可靠性分析与遗传算法优化模块')
+    st.caption('矿井通风网络模拟系统 v5.0 | 含多目标遗传算法优化、方案对比、敏感性分析与结果持久化')
 
 
 if __name__ == '__main__':

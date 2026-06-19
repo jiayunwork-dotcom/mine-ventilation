@@ -10,6 +10,9 @@ from core.genetic_optimization import GAOptimizationResult, GenerationHistory, G
 
 def plot_ga_convergence_curve(
     history: List[GenerationHistory],
+    converged: bool = False,
+    convergence_reason: str = '',
+    generations_run: int = 0,
     figsize: Tuple[int, int] = (12, 7)
 ) -> plt.Figure:
     fig, ax = plt.subplots(figsize=figsize)
@@ -28,7 +31,7 @@ def plot_ga_convergence_curve(
     ax.set_xlabel('代数 (Generation)', fontsize=13)
     ax.set_ylabel('适应度值 (总功率+惩罚项，W)', fontsize=13)
     ax.set_title('遗传算法收敛曲线', fontsize=16, fontweight='bold', pad=15)
-    ax.legend(loc='best', fontsize=11, framealpha=0.9)
+    ax.legend(loc='upper right', fontsize=11, framealpha=0.9)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.tick_params(axis='both', labelsize=11)
 
@@ -47,6 +50,15 @@ def plot_ga_convergence_curve(
         props = dict(boxstyle='round', facecolor='wheat', alpha=0.85)
         ax.text(0.02, 0.98, text_str, transform=ax.transAxes, fontsize=11,
                 verticalalignment='top', bbox=props, zorder=10)
+
+    if converged or convergence_reason:
+        conv_text = f'实际收敛代数: {generations_run}'
+        if convergence_reason:
+            conv_text += f'\n提前终止: {convergence_reason}'
+        conv_props = dict(boxstyle='round', facecolor='#ffcccc', alpha=0.9)
+        ax.text(0.98, 0.98, conv_text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', horizontalalignment='right',
+                bbox=conv_props, zorder=10, color='#c0392b')
 
     plt.tight_layout()
     return fig
@@ -334,6 +346,112 @@ def plot_ga_power_comparison(
     props = dict(boxstyle='round', facecolor='#d5f5e3' if result.energy_saving_percent > 0 else '#ffebee', alpha=0.9)
     ax.text(0.02, 0.98, summary_text, transform=ax.transAxes, fontsize=11,
             verticalalignment='top', bbox=props)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_sensitivity_heatmap(
+    sensitivity_data: Dict[str, Dict[float, Tuple[float, int]]],
+    figsize: Tuple[int, int] = (10, 6)
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    param_names = list(sensitivity_data.keys())
+    if not param_names:
+        ax.text(0.5, 0.5, '无敏感性分析数据', ha='center', va='center', fontsize=14,
+                transform=ax.transAxes)
+        return fig
+
+    levels_set = set()
+    for levels in sensitivity_data.values():
+        levels_set.update(levels.keys())
+    levels = sorted(levels_set)
+
+    matrix = np.full((len(param_names), len(levels)), np.nan)
+    for i, pname in enumerate(param_names):
+        for j, lvl in enumerate(levels):
+            if lvl in sensitivity_data[pname]:
+                matrix[i, j] = sensitivity_data[pname][lvl][0]
+
+    im = ax.imshow(matrix, cmap='RdYlGn_r', aspect='auto')
+
+    ax.set_xticks(range(len(levels)))
+    level_labels = [f'{lvl:.1f}x' for lvl in levels]
+    ax.set_xticklabels(level_labels, fontsize=11)
+
+    param_labels_cn = {
+        'population_size': '种群大小',
+        'crossover_prob': '交叉概率',
+        'mutation_prob': '变异概率',
+    }
+    ax.set_yticks(range(len(param_names)))
+    ax.set_yticklabels([param_labels_cn.get(p, p) for p in param_names], fontsize=11)
+
+    for i in range(len(param_names)):
+        for j in range(len(levels)):
+            val = matrix[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f'{val:.0f}', ha='center', va='center', fontsize=9,
+                        color='white' if val > np.nanmax(matrix) * 0.7 else 'black',
+                        fontweight='bold')
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('最终适应度 (W)', fontsize=11)
+
+    ax.set_title('参数敏感性分析热力图\n(颜色越深 = 适应度越差)', fontsize=14, fontweight='bold', pad=12)
+    ax.set_xlabel('参数水平 (相对基准值)', fontsize=12)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_scheme_comparison_bar(
+    schemes: List[Dict],
+    workface_ids: List[int],
+    figsize: Tuple[int, int] = (14, 7)
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize)
+
+    n_schemes = len(schemes)
+    n_workfaces = len(workface_ids)
+
+    if n_schemes == 0 or n_workfaces == 0:
+        ax.text(0.5, 0.5, '无方案对比数据', ha='center', va='center', fontsize=14,
+                transform=ax.transAxes)
+        return fig
+
+    x = np.arange(n_workfaces)
+    total_width = 0.8
+    bar_width = total_width / n_schemes
+
+    colors = plt.cm.Set2(np.linspace(0, 1, max(n_schemes, 2)))
+
+    for s_idx, scheme in enumerate(schemes):
+        offset = (s_idx - (n_schemes - 1) / 2) * bar_width
+        airflows = []
+        for wf_id in sorted(workface_ids):
+            airflows.append(scheme.get('workface_airflows', {}).get(wf_id, 0.0))
+        bars = ax.bar(x + offset, airflows, bar_width * 0.9,
+                      label=scheme.get('label', f'方案{s_idx+1}'),
+                      color=colors[s_idx], alpha=0.85, edgecolor='black', linewidth=0.6)
+        for bar, q in zip(bars, airflows):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2., height + 0.05,
+                    f'{q:.2f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    threshold = schemes[0].get('min_airflow_threshold', 4.0) if schemes else 4.0
+    ax.axhline(y=threshold, color='#d35400', linestyle='--',
+               linewidth=2.5, label=f'最低通风量阈值 ({threshold} m³/s)', zorder=4)
+
+    ax.set_xlabel('工作面分支', fontsize=13)
+    ax.set_ylabel('风量 (m³/s)', fontsize=13)
+    ax.set_title('不同优化方案各工作面风量对比', fontsize=15, fontweight='bold', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'分支{wf_id}' for wf_id in sorted(workface_ids)], fontsize=11)
+    ax.legend(loc='best', fontsize=10, framealpha=0.9)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.tick_params(axis='both', labelsize=11)
 
     plt.tight_layout()
     return fig

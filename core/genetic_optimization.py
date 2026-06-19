@@ -42,6 +42,9 @@ class GAParameters:
     tolerance: float = 0.001
     max_iterations: int = 500
     random_seed: Optional[int] = None
+    optimization_mode: str = 'single'
+    energy_weight: float = 1.0
+    uniformity_weight: float = 0.0
 
 
 @dataclass
@@ -74,6 +77,10 @@ class GAOptimizationResult:
     converged: bool = False
     constraint_satisfied: Dict[int, bool] = field(default_factory=dict)
     total_violation: float = 0.0
+    uniformity_value: float = 0.0
+    initial_uniformity: float = 0.0
+    pareto_efficiency: float = 0.0
+    convergence_reason: str = ''
 
 
 def _deep_copy_network(network: VentilationNetwork) -> VentilationNetwork:
@@ -149,7 +156,7 @@ def _evaluate_single(
     damper_ids: List[int],
     workface_ids: List[int],
     params: GAParameters,
-) -> Tuple[float, float, Dict[int, float], Dict[int, float], Dict[int, float], bool, float]:
+) -> Tuple[float, float, Dict[int, float], Dict[int, float], Dict[int, float], bool, float, float]:
     _apply_solution_to_network(network, solution, fan_ids, damper_ids, params)
 
     try:
@@ -160,12 +167,12 @@ def _evaluate_single(
         )
     except Exception:
         _restore_network_original(network, original_network)
-        return float('inf'), float('inf'), {}, {}, {}, False, float('inf')
+        return float('inf'), float('inf'), {}, {}, {}, False, float('inf'), float('inf')
 
     converged = info.get('converged', False)
     if not converged:
         _restore_network_original(network, original_network)
-        return float('inf'), float('inf'), {}, {}, {}, False, float('inf')
+        return float('inf'), float('inf'), {}, {}, {}, False, float('inf'), float('inf')
 
     network.update_solution(airflows, pressures)
     calculate_all_branch_resistances(network)
@@ -186,10 +193,30 @@ def _evaluate_single(
             deficit = max(0.0, params.min_airflow_threshold - wf_q)
             total_violation += deficit * deficit
 
+    uniformity = 0.0
+    if workface_ids and params.optimization_mode == 'dual':
+        deviations = []
+        for wf_id in workface_ids:
+            wf_q = workface_airflow_values.get(wf_id, 0.0)
+            deviation = wf_q - params.min_airflow_threshold
+            deviations.append(deviation)
+        if len(deviations) > 1:
+            uniformity = float(np.std(deviations))
+        elif len(deviations) == 1:
+            uniformity = abs(deviations[0])
+
     _restore_network_original(network, original_network)
 
-    fitness = total_power + params.penalty_coefficient * total_violation
-    return fitness, total_power, airflows, pressures, workface_airflow_values, True, total_violation
+    if params.optimization_mode == 'dual':
+        energy_obj = total_power
+        uniformity_obj = uniformity * params.penalty_coefficient
+        fitness = (params.energy_weight * energy_obj
+                   + params.uniformity_weight * uniformity_obj
+                   + params.penalty_coefficient * total_violation)
+    else:
+        fitness = total_power + params.penalty_coefficient * total_violation
+
+    return fitness, total_power, airflows, pressures, workface_airflow_values, True, total_violation, uniformity
 
 
 def _initialize_population(
@@ -372,7 +399,7 @@ def run_genetic_optimization(
     rng = np.random.default_rng(params.random_seed)
 
     initial_solution = np.ones(n_vars)
-    initial_fitness, initial_power, _, _, _, _, initial_violation = _evaluate_single(
+    initial_fitness, initial_power, _, _, _, _, initial_violation, initial_uniformity = _evaluate_single(
         work_network, original_network, initial_solution,
         fan_ids, damper_ids, workface_branch_ids, params
     )
@@ -401,16 +428,18 @@ def run_genetic_optimization(
     best_pressures_overall = {}
     best_wf_airflows_overall = {}
     best_total_violation_overall = 0.0
+    best_uniformity_overall = 0.0
 
     no_improve_count = 0
     ga_converged = False
     final_generation = 0
+    convergence_reason = ''
 
     for gen in range(params.max_generations):
         final_generation = gen + 1
 
         for idx in range(params.population_size):
-            fit, pow_val, airflows, pressures, wf_airflows, conv, viol = _evaluate_single(
+            fit, pow_val, airflows, pressures, wf_airflows, conv, viol, unif = _evaluate_single(
                 work_network, original_network, population[idx],
                 fan_ids, damper_ids, workface_branch_ids, params
             )
@@ -427,6 +456,7 @@ def run_genetic_optimization(
                 best_pressures_overall = pressures.copy()
                 best_wf_airflows_overall = wf_airflows.copy()
                 best_total_violation_overall = viol
+                best_uniformity_overall = unif
 
         sorted_indices = np.argsort(fitness_array)
         best_gen_fitness = fitness_array[sorted_indices[0]]
@@ -451,6 +481,10 @@ def run_genetic_optimization(
 
             if no_improve_count >= params.convergence_generations:
                 ga_converged = True
+                convergence_reason = (
+                    f'连续{params.convergence_generations}代改善不足'
+                    f'{params.convergence_improvement*100:.1f}%'
+                )
                 if progress_callback:
                     progress_callback(
                         gen + 1, params.max_generations,
@@ -514,7 +548,10 @@ def run_genetic_optimization(
             history=history,
             total_time=total_time,
             generations_run=final_generation,
-            converged=ga_converged
+            converged=ga_converged,
+            uniformity_value=0.0,
+            initial_uniformity=initial_uniformity,
+            convergence_reason=convergence_reason or ('达到最大代数' if not ga_converged else ''),
         )
 
     n_fans = len(fan_ids)
@@ -535,6 +572,17 @@ def run_genetic_optimization(
     if initial_power > 0 and best_power_overall < initial_power:
         energy_saving_percent = (initial_power - best_power_overall) / initial_power * 100.0
 
+    pareto_efficiency = 0.0
+    if params.optimization_mode == 'dual' and initial_power > 0:
+        energy_improve = max(0.0, (initial_power - best_power_overall) / initial_power)
+        uniformity_improve = 0.0
+        if initial_uniformity > 0:
+            uniformity_improve = max(0.0, (initial_uniformity - best_uniformity_overall) / initial_uniformity)
+        pareto_efficiency = params.energy_weight * energy_improve + params.uniformity_weight * uniformity_improve
+
+    if not convergence_reason and not ga_converged:
+        convergence_reason = f'达到最大代数({params.max_generations})'
+
     return GAOptimizationResult(
         success=True,
         message="优化完成",
@@ -554,7 +602,11 @@ def run_genetic_optimization(
         generations_run=final_generation,
         converged=ga_converged,
         constraint_satisfied=constraint_satisfied,
-        total_violation=best_total_violation_overall
+        total_violation=best_total_violation_overall,
+        uniformity_value=best_uniformity_overall,
+        initial_uniformity=initial_uniformity,
+        pareto_efficiency=pareto_efficiency,
+        convergence_reason=convergence_reason,
     )
 
 
@@ -590,6 +642,9 @@ def export_ga_result_to_json(result: GAOptimizationResult) -> str:
         'tolerance': result.parameters.tolerance,
         'max_iterations': result.parameters.max_iterations,
         'random_seed': result.parameters.random_seed,
+        'optimization_mode': result.parameters.optimization_mode,
+        'energy_weight': result.parameters.energy_weight,
+        'uniformity_weight': result.parameters.uniformity_weight,
     }
 
     wf_data = {}
@@ -621,7 +676,94 @@ def export_ga_result_to_json(result: GAOptimizationResult) -> str:
         'generations_run': int(result.generations_run),
         'converged': bool(result.converged),
         'constraint_satisfied': {str(k): bool(v) for k, v in result.constraint_satisfied.items()},
-        'total_violation': float(result.total_violation)
+        'total_violation': float(result.total_violation),
+        'uniformity_value': float(result.uniformity_value),
+        'initial_uniformity': float(result.initial_uniformity),
+        'pareto_efficiency': float(result.pareto_efficiency),
+        'convergence_reason': result.convergence_reason,
     }
 
     return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def import_ga_result_from_json(json_str: str) -> GAOptimizationResult:
+    data = json.loads(json_str)
+
+    p = data.get('parameters', {})
+    params = GAParameters(
+        population_size=p.get('population_size', 50),
+        max_generations=p.get('max_generations', 100),
+        crossover_prob=p.get('crossover_prob', 0.8),
+        mutation_prob=p.get('mutation_prob', 0.1),
+        elitism_count=p.get('elitism_count', 2),
+        tournament_size=p.get('tournament_size', 3),
+        sbx_distribution_index=p.get('sbx_distribution_index', 20.0),
+        pm_distribution_index=p.get('pm_distribution_index', 20.0),
+        penalty_coefficient=p.get('penalty_coefficient', 10000.0),
+        min_airflow_threshold=p.get('min_airflow_threshold', 4.0),
+        convergence_generations=p.get('convergence_generations', 20),
+        convergence_improvement=p.get('convergence_improvement', 0.001),
+        fan_speed_min=p.get('fan_speed_min', 0.5),
+        fan_speed_max=p.get('fan_speed_max', 1.2),
+        damper_open_min=p.get('damper_open_min', 0.0),
+        damper_open_max=p.get('damper_open_max', 1.0),
+        damper_max_resistance_multiplier=p.get('damper_max_resistance_multiplier', 50.0),
+        tolerance=p.get('tolerance', 0.001),
+        max_iterations=p.get('max_iterations', 500),
+        random_seed=p.get('random_seed'),
+        optimization_mode=p.get('optimization_mode', 'single'),
+        energy_weight=p.get('energy_weight', 1.0),
+        uniformity_weight=p.get('uniformity_weight', 0.0),
+    )
+
+    history = []
+    for h in data.get('history', []):
+        best_ind = None
+        if h.get('best_individual') is not None:
+            best_ind = np.array(h['best_individual'])
+        history.append(GenerationHistory(
+            generation=int(h['generation']),
+            best_fitness=float(h['best_fitness']),
+            avg_fitness=float(h['avg_fitness']),
+            worst_fitness=float(h['worst_fitness']),
+            best_individual=best_ind,
+        ))
+
+    best_solution = None
+    if data.get('best_solution') is not None:
+        best_solution = np.array(data['best_solution'])
+
+    wf_airflows = {}
+    wf_data = data.get('workface_airflows', {})
+    for k, v in wf_data.items():
+        wf_airflows[int(k)] = v.get('airflow', 0.0) if isinstance(v, dict) else float(v)
+
+    constraint_satisfied = {}
+    for k, v in data.get('constraint_satisfied', {}).items():
+        constraint_satisfied[int(k)] = bool(v)
+
+    return GAOptimizationResult(
+        success=bool(data.get('success', False)),
+        message=data.get('message', ''),
+        parameters=params,
+        best_solution=best_solution,
+        best_fitness=float(data.get('best_fitness', float('inf'))),
+        best_power=float(data.get('best_power_W', 0.0)),
+        initial_power=float(data.get('initial_power_W', 0.0)),
+        energy_saving_percent=float(data.get('energy_saving_percent', 0.0)),
+        fan_speeds={int(k): float(v) for k, v in data.get('fan_speeds', {}).items()},
+        damper_openings={int(k): float(v) for k, v in data.get('damper_openings', {}).items()},
+        workface_airflows=wf_airflows,
+        all_airflows={int(k): float(v) for k, v in data.get('all_airflows_m3s', {}).items()},
+        all_pressures={int(k): float(v) for k, v in data.get('all_pressures_Pa', {}).items()},
+        history=history,
+        total_time=float(data.get('total_time_s', 0.0)),
+        generations_run=int(data.get('generations_run', 0)),
+        converged=bool(data.get('converged', False)),
+        constraint_satisfied=constraint_satisfied,
+        total_violation=float(data.get('total_violation', 0.0)),
+        uniformity_value=float(data.get('uniformity_value', 0.0)),
+        initial_uniformity=float(data.get('initial_uniformity', 0.0)),
+        pareto_efficiency=float(data.get('pareto_efficiency', 0.0)),
+        convergence_reason=data.get('convergence_reason', ''),
+    )
